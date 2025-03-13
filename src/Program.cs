@@ -89,109 +89,87 @@ else if (command == "ls-tree")
     Console.WriteLine(fileName);
   }
 }
-else if (command == "write-tree")
+else if (command == "write-tree") 
 {
-    string workingDirectory = Directory.GetCurrentDirectory();
-    string gitDirectory = Path.Combine(workingDirectory, ".git");
-
-    // Recursively create the tree object for the working directory
-    string treeHash = CreateTreeObject(workingDirectory, gitDirectory);
-
-    // Print the tree hash
-    Console.WriteLine(treeHash);
+  var currentPath = Directory.GetCurrentDirectory();
+  var currentFilePathHash = GenerateTreeObjectFileHash(currentPath);
+  var hashString = Convert.ToHexString(currentFilePathHash).ToLower();
+  Console.Write(hashString);
 }
 else
 {
     throw new ArgumentException($"Unknown command {command}");
 }
 
-static string CreateTreeObject(string directory, string gitDirectory)
+byte[] CreateObjectHeaderInBytes(string gitObjectType, byte[] input) => Encoding.UTF8.GetBytes($"{gitObjectType} {input.Length}\0");
+
+byte[] GenerateHashByte(string gitObjectType, byte[] input) 
 {
-    var entries = new List<(string Mode, string Name, string Hash)>();
+  var objectHeader = CreateObjectHeaderInBytes(gitObjectType, input);
+  var gitObject = (objectHeader.Concat(input)).ToArray();
+  var hash = SHA1.HashData(gitObject);
+  using MemoryStream memoryStream = new MemoryStream();
+  using (ZLibStream zlibStream = new ZLibStream(memoryStream, CompressionLevel.Optimal)) 
+  {
+    zlibStream.Write(gitObject, 0, gitObject.Length);
+  }
+  
+  var compressedObject = memoryStream.ToArray();
+  var hashString = Convert.ToHexString(hash).ToLower();
+  Directory.CreateDirectory($".git/objects/{hashString[..2]}");
+  File.WriteAllBytes($".git/objects/{hashString[..2]}/{hashString[2..]}",compressedObject);
 
-    foreach (var file in Directory.GetFiles(directory))
-    {
-        if (Path.GetFileName(file) == ".git") continue;
-
-        string fileContent = File.ReadAllText(file);
-        string fileHash = CreateBlobObject(fileContent, gitDirectory);
-
-        entries.Add(("100644", Path.GetFileName(file), fileHash));
-    }
-
-    foreach (var subDir in Directory.GetDirectories(directory))
-    {
-        if (Path.GetFileName(subDir) == ".git") continue;
-
-        string subDirHash = CreateTreeObject(subDir, gitDirectory);
-        entries.Add(("40000", Path.GetFileName(subDir), subDirHash));
-    }
-
-    // Sort entries by name
-    entries.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.Ordinal));
-
-    // Create the tree content
-    var treeContent = new MemoryStream();
-    foreach (var entry in entries)
-    {
-        string entryLine = $"{entry.Mode} {entry.Name}\0{HexToBytes(entry.Hash)}";
-        treeContent.Write(Encoding.UTF8.GetBytes(entryLine), 0, entryLine.Length);
-    }
-
-    // Create the tree object
-    string treeHeader = $"tree {treeContent.Length}\0";
-    var treeObject = new MemoryStream();
-    treeObject.Write(Encoding.UTF8.GetBytes(treeHeader), 0, treeHeader.Length);
-    treeContent.WriteTo(treeObject);
-
-    // Compute the SHA-1 hash of the tree object
-    using SHA1 sha1 = SHA1.Create();
-    byte[] hashBytes = sha1.ComputeHash(treeObject.ToArray());
-    string treeHash = BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
-
-    // Write the tree object to .git/objects
-    string objectDir = Path.Combine(gitDirectory, "objects", treeHash[..2]);
-    string objectPath = Path.Combine(objectDir, treeHash[2..]);
-    Directory.CreateDirectory(objectDir);
-
-    using FileStream fileStream = File.Create(objectPath);
-    using ZLibStream zLibStream = new(fileStream, CompressionMode.Compress);
-    zLibStream.Write(treeObject.ToArray(), 0, (int)treeObject.Length);
-
-    return treeHash;
+  return hash;
 }
 
-static string CreateBlobObject(string content, string gitDirectory)
+byte[]? GenerateTreeObjectFileHash(string currentPath) 
 {
-    string header = $"blob {content.Length}\0";
-    byte[] headerBytes = Encoding.UTF8.GetBytes(header);
-    byte[] contentBytes = Encoding.UTF8.GetBytes(content);
+  if (currentPath.Contains(".git"))
+    return null;
 
-    byte[] blobData = new byte[headerBytes.Length + contentBytes.Length];
-    Buffer.BlockCopy(headerBytes, 0, blobData, 0, headerBytes.Length);
-    Buffer.BlockCopy(contentBytes, 0, blobData, headerBytes.Length, contentBytes.Length);
-
-    using SHA1 sha1 = SHA1.Create();
-    byte[] hashBytes = sha1.ComputeHash(blobData);
-    string hash = BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
-
-    string objectDir = Path.Combine(gitDirectory, "objects", hash[..2]);
-    string objectPath = Path.Combine(objectDir, hash[2..]);
-    Directory.CreateDirectory(objectDir);
-
-    using FileStream fileStream = File.Create(objectPath);
-    using ZLibStream zLibStream = new(fileStream, CompressionMode.Compress);
-    zLibStream.Write(blobData, 0, blobData.Length);
-
-    return hash;
-}
-
-static byte[] HexToBytes(string hex)
-{
-    byte[] bytes = new byte[hex.Length / 2];
-    for (int i = 0; i < hex.Length; i += 2)
+  var files = Directory.GetFiles(currentPath);
+  var directories = Directory.GetDirectories(currentPath);
+  var treeEntries = new List<TreeEntry>();
+  
+  foreach (var file in files) 
+  {
+    string fileName = Path.GetFileName(file);
+    var fileContentInBytes = File.ReadAllBytes(file);
+    var fileHash = GenerateHashByte("blob", fileContentInBytes);
+    var fileEntry = new TreeEntry("100644", fileName, fileHash);
+    treeEntries.Add(fileEntry);
+  }
+  
+  for (var i = 0; i < directories.Length; i++) 
+  {
+    var directoryName = Path.GetFileName(directories[i]);
+    var directoryHash = GenerateTreeObjectFileHash(directories[i]);
+    
+    if (directoryHash is not null) 
     {
-        bytes[i / 2] = Convert.ToByte(hex.Substring(i, 2), 16);
+      var directoryEntry = new TreeEntry("40000", directoryName, directoryHash);
+      treeEntries.Add(directoryEntry);
     }
-    return bytes;
+  }
+
+  return GenerateHashByte("tree", CreateTreeObject(treeEntries));
 }
+
+byte[] CreateTreeObject(List<TreeEntry> treeEntries) 
+{
+  using var memoryStream = new MemoryStream();
+  using var streamWriter = new StreamWriter(memoryStream, new UTF8Encoding(false));
+  
+  foreach (var entry in treeEntries.OrderBy(x => x.FileName)) 
+  {
+    var line = $"{entry.Mode} {entry.FileName}\x00";
+    streamWriter.Write(line);
+    streamWriter.Flush();
+    memoryStream.Write(entry.Hash, 0, entry.Hash.Length);
+  }
+  
+  streamWriter.Flush();
+  return memoryStream.ToArray();
+}
+
+public record TreeEntry(string Mode, string FileName, byte[] Hash);
