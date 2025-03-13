@@ -96,6 +96,60 @@ else if (command == "write-tree")
   var hashString = Convert.ToHexString(currentFilePathHash).ToLower();
   Console.Write(hashString);
 }
+else if (command == "commit-tree") 
+{
+  if (args.Length < 6 || args[1] == null || args[3] != "-p" || args[5] != "-m")
+  {
+    Console.WriteLine("Usage: commit-tree <tree_sha> -p <commit_sha> -m <message>");
+    return;
+  }
+
+  string treeSha = args[1];
+  string parentCommitSha = args[4];
+  string message = args[6];
+
+  // Hardcoded author/committer information
+  string authorName = "John Doe";
+  string authorEmail = "john.doe@example.com";
+  DateTimeOffset timestamp = DateTimeOffset.UtcNow;
+
+  // Create the commit object content
+  string commitContent = $"tree {treeSha}\n" +
+                         $"parent {parentCommitSha}\n" +
+                         $"author {authorName} <{authorEmail}> {timestamp.ToUnixTimeSeconds()} +0000\n" +
+                         $"committer {authorName} <{authorEmail}> {timestamp.ToUnixTimeSeconds()} +0000\n" +
+                         $"\n" +
+                         $"{message}\n";
+
+  // Convert the commit content to bytes
+  byte[] commitBytes = Encoding.UTF8.GetBytes(commitContent);
+
+  // Create the commit header
+  string header = $"commit {commitBytes.Length}\0";
+  byte[] headerBytes = Encoding.UTF8.GetBytes(header);
+
+  // Combine header and content
+  byte[] commitObject = new byte[headerBytes.Length + commitBytes.Length];
+  Buffer.BlockCopy(headerBytes, 0, commitObject, 0, headerBytes.Length);
+  Buffer.BlockCopy(commitBytes, 0, commitObject, headerBytes.Length, commitBytes.Length);
+
+  // Compute SHA-1 hash
+  using SHA1 sha1 = SHA1.Create();
+  byte[] hashBytes = sha1.ComputeHash(commitObject);
+  string hash = BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
+
+  // Write the commit object to .git/objects
+  string objectDir = Path.Combine(".git", "objects", hash[..2]);
+  string objectPath = Path.Combine(objectDir, hash[2..]);
+  Directory.CreateDirectory(objectDir);
+
+  using FileStream fileStream = File.Create(objectPath);
+  using ZLibStream zLibStream = new(fileStream, CompressionMode.Compress);
+  zLibStream.Write(commitObject, 0, commitObject.Length);
+
+  // Print the commit hash
+  Console.WriteLine(hash);
+}
 else
 {
     throw new ArgumentException($"Unknown command {command}");
@@ -167,7 +221,7 @@ byte[] CreateTreeObject(List<TreeEntry> treeEntries)
     streamWriter.Flush();
     memoryStream.Write(entry.Hash, 0, entry.Hash.Length);
   }
-  
+
   streamWriter.Flush();
   return memoryStream.ToArray();
 }
