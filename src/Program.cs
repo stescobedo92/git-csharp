@@ -70,20 +70,25 @@ else if (command == "hash-object" && args[1] == "-w")
     // Print the hash
     Console.WriteLine(hash);
 }
-else if (command == "ls-tree") {
+else if (command == "ls-tree") 
+{
   var hash = args[2];
   var treePath = Path.Combine(".git", "objects", hash[..2], hash[2..]);
   var contentBytes = File.ReadAllBytes(treePath);
+  
   using var memoryStream = new MemoryStream(contentBytes);
   using var zStream = new ZLibStream(memoryStream, CompressionMode.Decompress);
   using var reader = new StreamReader(zStream);
+  
   var treeObject = reader.ReadToEnd();
   var splittedContent = treeObject.Split("\0");
-  var fileNames =
-      splittedContent.Skip(1).Select(s => s.Split(" ").Last()).SkipLast(1);
-  foreach (var fileName in fileNames) {
+  var fileNames = splittedContent.Skip(1).Select(s => s.Split(" ").Last()).SkipLast(1);
+  
+  foreach (var fileName in fileNames) 
+  {
     Console.WriteLine(fileName);
   }
+}
 else
 {
     throw new ArgumentException($"Unknown command {command}");
