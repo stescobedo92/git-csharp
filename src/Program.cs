@@ -72,44 +72,60 @@ else if (command == "hash-object" && args[1] == "-w")
 }
 else if (command == "ls-tree")
 {
+    if (args.Length < 3)
+    {
+        Console.WriteLine("Usage: ls-tree [--name-only] <tree_sha>");
+        return;
+    }
+
     bool nameOnly = args[1] == "--name-only";
     string treeSha = nameOnly ? args[2] : args[1];
+    string treePath = Path.Combine(".git", "objects", treeSha[..2], treeSha[2..]);
 
-    string path = Path.Combine(".git", "objects", treeSha[..2], treeSha[2..]);
-    using FileStream fileStream = File.OpenRead(path);
-    using ZLibStream zLibStream = new(fileStream, CompressionMode.Decompress);
-    MemoryStream uncompressedStream = new();
-    zLibStream.CopyTo(uncompressedStream);
-    byte[] treeData = uncompressedStream.ToArray();
-
-    int pos = 0;
-    while (pos < treeData.Length)
+    if (!File.Exists(treePath))
     {
-        // Parse mode
-        int spaceIndex = Array.IndexOf(treeData, (byte)' ', pos);
-        string mode = Encoding.UTF8.GetString(treeData, pos, spaceIndex - pos);
-        pos = spaceIndex + 1;
+        Console.WriteLine($"Tree object not found: {treeSha}");
+        return;
+    }
 
-        // Parse name
-        int nullIndex = Array.IndexOf(treeData, (byte)0, pos);
-        string name = Encoding.UTF8.GetString(treeData, pos, nullIndex - pos);
-        pos = nullIndex + 1;
+    // Step 1: Read and decompress the tree object
+    byte[] treeData;
+    using (FileStream fileStream = File.OpenRead(treePath))
+    using (ZLibStream zlibStream = new ZLibStream(fileStream, CompressionMode.Decompress))
+    using (MemoryStream memoryStream = new MemoryStream())
+    {
+        zlibStream.CopyTo(memoryStream);
+        treeData = memoryStream.ToArray();
+    }
 
-        // Parse SHA (20 bytes)
-        byte[] shaBytes = new byte[20];
-        Array.Copy(treeData, pos, shaBytes, 0, 20);
+    // Step 2: Parse the tree object
+    int offset = 0;
+    while (offset < treeData.Length)
+    {
+        // Read mode (e.g., 40000 for directories, 100644 for files)
+        int spaceIndex = Array.IndexOf(treeData, (byte)' ', offset);
+        string mode = Encoding.UTF8.GetString(treeData[offset..spaceIndex]);
+        offset = spaceIndex + 1;
+
+        // Read name (file/directory name)
+        int nullByteIndex = Array.IndexOf(treeData, (byte)0, offset);
+        string name = Encoding.UTF8.GetString(treeData[offset..nullByteIndex]);
+        offset = nullByteIndex + 1;
+
+        // Read SHA-1 hash (20 bytes)
+        byte[] shaBytes = treeData[offset..(offset + 20)];
         string sha = BitConverter.ToString(shaBytes).Replace("-", "").ToLower();
-        pos += 20;
+        offset += 20;
 
-        // Output based on flags
+        // Output based on --name-only flag
         if (nameOnly)
         {
             Console.WriteLine(name);
         }
         else
         {
-            string type = mode == "40000" ? "tree" : "blob";
-            Console.WriteLine($"{mode} {type} {sha}    {name}");
+            string type = mode.StartsWith("4") ? "tree" : "blob";
+            Console.WriteLine($"{mode} {type} {sha}\t{name}");
         }
     }
 }
