@@ -70,6 +70,49 @@ else if (command == "hash-object" && args[1] == "-w")
     // Print the hash
     Console.WriteLine(hash);
 }
+else if (command == "ls-tree")
+{
+    bool nameOnly = args[1] == "--name-only";
+    string treeSha = nameOnly ? args[2] : args[1];
+
+    string path = Path.Combine(".git", "objects", treeSha[..2], treeSha[2..]);
+    using FileStream fileStream = File.OpenRead(path);
+    using ZLibStream zLibStream = new(fileStream, CompressionMode.Decompress);
+    MemoryStream uncompressedStream = new();
+    zLibStream.CopyTo(uncompressedStream);
+    byte[] treeData = uncompressedStream.ToArray();
+
+    int pos = 0;
+    while (pos < treeData.Length)
+    {
+        // Parse mode
+        int spaceIndex = Array.IndexOf(treeData, (byte)' ', pos);
+        string mode = Encoding.UTF8.GetString(treeData, pos, spaceIndex - pos);
+        pos = spaceIndex + 1;
+
+        // Parse name
+        int nullIndex = Array.IndexOf(treeData, (byte)0, pos);
+        string name = Encoding.UTF8.GetString(treeData, pos, nullIndex - pos);
+        pos = nullIndex + 1;
+
+        // Parse SHA (20 bytes)
+        byte[] shaBytes = new byte[20];
+        Array.Copy(treeData, pos, shaBytes, 0, 20);
+        string sha = BitConverter.ToString(shaBytes).Replace("-", "").ToLower();
+        pos += 20;
+
+        // Output based on flags
+        if (nameOnly)
+        {
+            Console.WriteLine(name);
+        }
+        else
+        {
+            string type = mode == "40000" ? "tree" : "blob";
+            Console.WriteLine($"{mode} {type} {sha}    {name}");
+        }
+    }
+}
 else
 {
     throw new ArgumentException($"Unknown command {command}");
