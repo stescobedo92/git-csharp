@@ -1,587 +1,414 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
 using System.IO.Compression;
-using System.Linq;
-using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
+using LibGit2Sharp;
 
-namespace GitCloneImplementation
+class Program 
 {
-    class Program
-    {
-        static void Main(string[] args)
-        {
-            if (args.Length < 1)
-            {
-                Console.WriteLine("Please provide a command.");
-                return;
-            }
-            string command = args[0];
-
-            if (command == "init")
-            {
-                Directory.CreateDirectory(".git");
-                Directory.CreateDirectory(".git/objects");
-                Directory.CreateDirectory(".git/refs");
-                File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n");
-                Console.WriteLine("Initialized git directory");
-            }
-            else if (command == "cat-file" && args[1] == "-p")
-            {
-                string fileName = args[2];
-                string path = Path.Combine(".git", "objects", fileName[..2], fileName[2..]);
-                using FileStream fileStream = File.OpenRead(path);
-                using ZLibStream zLibStream = new(fileStream, CompressionMode.Decompress);
-                MemoryStream uncompressedStream = new();
-                zLibStream.CopyTo(uncompressedStream);
-                Memory<byte> memory = new Memory<byte>(uncompressedStream.GetBuffer())[..(int)uncompressedStream.Length];
-                string objectType = Encoding.UTF8.GetString(memory.Span[..4]);
-                int nullByteIndex = memory[5..].Span.IndexOf((byte)0);
-                Memory<byte> blobStr = memory[5..][(nullByteIndex + 1)..];
-
-                if (int.TryParse(Encoding.UTF8.GetString(memory[5..].Span[..nullByteIndex]), out int blobLength) && blobLength != blobStr.Length)
-                {
-                    Console.WriteLine("Bad blob length");
-                    return;
-                }
-
-                Console.Write(Encoding.UTF8.GetString(blobStr.Span));
-            }
-            else if (command == "hash-object" && args[1] == "-w")
-            {
-                string filePath = args[2];
-                string fileContent = File.ReadAllText(filePath);
-
-                // Create the blob header
-                string header = $"blob {fileContent.Length}\0";
-                byte[] headerBytes = Encoding.UTF8.GetBytes(header);
-                byte[] contentBytes = Encoding.UTF8.GetBytes(fileContent);
-
-                // Combine header and content
-                byte[] blobData = new byte[headerBytes.Length + contentBytes.Length];
-                Buffer.BlockCopy(headerBytes, 0, blobData, 0, headerBytes.Length);
-                Buffer.BlockCopy(contentBytes, 0, blobData, headerBytes.Length, contentBytes.Length);
-
-                // Compute SHA-1 hash
-                using SHA1 sha1 = SHA1.Create();
-                byte[] hashBytes = sha1.ComputeHash(blobData);
-                string hash = BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
-
-                // Write the object to .git/objects
-                string objectDir = Path.Combine(".git", "objects", hash[..2]);
-                string objectPath = Path.Combine(objectDir, hash[2..]);
-                Directory.CreateDirectory(objectDir);
-
-                using FileStream fileStream = File.Create(objectPath);
-                using ZLibStream zLibStream = new(fileStream, CompressionMode.Compress);
-                zLibStream.Write(blobData, 0, blobData.Length);
-
-                // Print the hash
-                Console.WriteLine(hash);
-            }
-            else if (command == "ls-tree")
-            {
-                var hash = args[2];
-                var treePath = Path.Combine(".git", "objects", hash[..2], hash[2..]);
-                var contentBytes = File.ReadAllBytes(treePath);
-
-                using var memoryStream = new MemoryStream(contentBytes);
-                using var zStream = new ZLibStream(memoryStream, CompressionMode.Decompress);
-                using var reader = new StreamReader(zStream);
-
-                var treeObject = reader.ReadToEnd();
-                var splittedContent = treeObject.Split("\0");
-                var fileNames = splittedContent.Skip(1).Select(s => s.Split(" ").Last()).SkipLast(1);
-
-                foreach (var fileName in fileNames)
-                {
-                    Console.WriteLine(fileName);
-                }
-            }
-            else if (command == "write-tree")
-            {
-                var currentPath = Directory.GetCurrentDirectory();
-                var currentFilePathHash = GenerateTreeObjectFileHash(currentPath);
-                var hashString = Convert.ToHexString(currentFilePathHash).ToLower();
-                Console.Write(hashString);
-            }
-            else if (command == "commit-tree")
-            {
-                if (args.Length < 6 || args[2] != "-p" || args[4] != "-m")
-                {
-                    Console.WriteLine("Usage: commit-tree <tree_sha> -p <parent_sha> -m <message>");
-                    return;
-                }
-
-                string treeSha = args[1];
-                string parentSha = args[3];
-                string message = args[5];
-
-                // Hardcoded author/committer info for simplicity
-                string author = "Author Name <author@example.com>";
-                string committer = "Committer Name <committer@example.com>";
-
-                // Get current timestamp in Git format (Unix timestamp + timezone)
-                long unixTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                string timezone = "+0000"; // Using UTC for simplicity
-
-                // Construct the commit content
-                StringBuilder commitContent = new StringBuilder();
-                commitContent.AppendLine($"tree {treeSha}");
-                commitContent.AppendLine($"parent {parentSha}");
-                commitContent.AppendLine($"author {author} {unixTimestamp} {timezone}");
-                commitContent.AppendLine($"committer {committer} {unixTimestamp} {timezone}");
-                commitContent.AppendLine(); // Empty line before message
-                commitContent.AppendLine(message);
-
-                // Convert to bytes
-                byte[] commitBytes = Encoding.UTF8.GetBytes(commitContent.ToString());
-
-                // Use existing GenerateHashByte method to create the commit object
-                byte[] commitHash = GenerateHashByte("commit", commitBytes);
-                string hashString = Convert.ToHexString(commitHash).ToLower();
-
-                // Output the commit hash
-                Console.WriteLine(hashString);
-            }
-            else if (command == "clone")
-            {
-                if (args.Length < 3)
-                {
-                    Console.WriteLine("Usage: clone <repository_url> <target_directory>");
-                    return;
-                }
-
-                string repoUrl = args[1];
-                string targetDir = args[2];
-
-                if (Directory.Exists(targetDir))
-                {
-                    if (Directory.GetFiles(targetDir).Length > 0 || Directory.GetDirectories(targetDir).Length > 0)
-                    {
-                        Console.WriteLine("Target directory must be empty");
-                        return;
-                    }
-                }
-                else
-                {
-                    Directory.CreateDirectory(targetDir);
-                }
-
-                Directory.SetCurrentDirectory(targetDir);
-
-                Directory.CreateDirectory(".git");
-                Directory.CreateDirectory(".git/objects");
-                Directory.CreateDirectory(".git/refs");
-                File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n");
-
-                using (var client = new HttpClient())
-                {
-                    client.DefaultRequestHeaders.Add("User-Agent", "Custom-Git-Client");
-
-                    string infoRefsUrl = $"{repoUrl}/info/refs?service=git-upload-pack";
-                    var infoRefsResponse = client.GetAsync(infoRefsUrl).Result;
-                    if (!infoRefsResponse.IsSuccessStatusCode)
-                    {
-                        Console.WriteLine($"Failed to fetch refs: {infoRefsResponse.StatusCode}");
-                        return;
-                    }
-
-                    string infoRefsContent = infoRefsResponse.Content.ReadAsStringAsync().Result;
-                    var refs = ParseInfoRefs(infoRefsContent);
-
-                    string? headRef = refs.FirstOrDefault(r => r.Contains("HEAD"))?.Split(' ')[0];
-                    string headCommit = headRef ?? refs.FirstOrDefault(r => r.Contains("refs/heads/main"))?.Split(' ')[0];
-                    if (string.IsNullOrEmpty(headCommit))
-                    {
-                        Console.WriteLine("Could not determine HEAD commit");
-                        return;
-                    }
-
-                    string uploadPackUrl = $"{repoUrl}/git-upload-pack";
-                    string wantRequest = $"0032want {headCommit}\n0000\n0009done\n";
-                    var content = new StringContent(wantRequest, Encoding.UTF8, "application/x-git-upload-pack-request");
-                    var packResponse = client.PostAsync(uploadPackUrl, content).Result;
-                    if (!packResponse.IsSuccessStatusCode)
-                    {
-                        Console.WriteLine($"Failed to fetch pack: {packResponse.StatusCode}");
-                        return;
-                    }
-
-                    byte[] packData = packResponse.Content.ReadAsByteArrayAsync().Result;
-                    ProcessPackfile(packData);
-                    CheckoutHead(headCommit);
-                }
-
-                Console.WriteLine($"Cloned repository to {targetDir}");
-            }
-            else
-            {
-                throw new ArgumentException($"Unknown command {command}");
-            }
-        }
-
-        static byte[] CreateObjectHeaderInBytes(string gitObjectType, byte[] input) => Encoding.UTF8.GetBytes($"{gitObjectType} {input.Length}\0");
-
-        static byte[] GenerateHashByte(string gitObjectType, byte[] input)
-        {
-            var objectHeader = CreateObjectHeaderInBytes(gitObjectType, input);
-            var gitObject = (objectHeader.Concat(input)).ToArray();
-            var hash = SHA1.HashData(gitObject);
-            using MemoryStream memoryStream = new MemoryStream();
-            using (ZLibStream zlibStream = new ZLibStream(memoryStream, CompressionLevel.Optimal))
-            {
-                zlibStream.Write(gitObject, 0, gitObject.Length);
-            }
-
-            var compressedObject = memoryStream.ToArray();
-            var hashString = Convert.ToHexString(hash).ToLower();
-            Directory.CreateDirectory($".git/objects/{hashString[..2]}");
-            File.WriteAllBytes($".git/objects/{hashString[..2]}/{hashString[2..]}", compressedObject);
-
-            return hash;
-        }
-
-        static byte[]? GenerateTreeObjectFileHash(string currentPath)
-        {
-            if (currentPath.Contains(".git"))
-                return null;
-
-            var files = Directory.GetFiles(currentPath);
-            var directories = Directory.GetDirectories(currentPath);
-            var treeEntries = new List<TreeEntry>();
-
-            foreach (var file in files)
-            {
-                string fileName = Path.GetFileName(file);
-                var fileContentInBytes = File.ReadAllBytes(file);
-                var fileHash = GenerateHashByte("blob", fileContentInBytes);
-                var fileEntry = new TreeEntry("100644", fileName, fileHash);
-                treeEntries.Add(fileEntry);
-            }
-
-            for (var i = 0; i < directories.Length; i++)
-            {
-                var directoryName = Path.GetFileName(directories[i]);
-                var directoryHash = GenerateTreeObjectFileHash(directories[i]);
-
-                if (directoryHash is not null)
-                {
-                    var directoryEntry = new TreeEntry("40000", directoryName, directoryHash);
-                    treeEntries.Add(directoryEntry);
-                }
-            }
-
-            return GenerateHashByte("tree", CreateTreeObject(treeEntries));
-        }
-
-        static byte[] CreateTreeObject(List<TreeEntry> treeEntries)
-        {
-            using var memoryStream = new MemoryStream();
-            using var streamWriter = new StreamWriter(memoryStream, new UTF8Encoding(false));
-
-            foreach (var entry in treeEntries.OrderBy(x => x.FileName))
-            {
-                var line = $"{entry.Mode} {entry.FileName}\x00";
-                streamWriter.Write(line);
-                streamWriter.Flush();
-                memoryStream.Write(entry.Hash, 0, entry.Hash.Length);
-            }
-
-            streamWriter.Flush();
-            return memoryStream.ToArray();
-        }
-
-        // Clone Helper Methods
-
-        static List<string> ParseInfoRefs(string content)
-        {
-            var lines = content.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-            var refs = new List<string>();
-            foreach (var line in lines)
-            {
-                if (line.StartsWith("#") || line.Length < 40) continue;
-                string hashAndRef = line.Substring(4); // Skip pkt-line length prefix
-                if (hashAndRef.Length >= 40)
-                {
-                    refs.Add(hashAndRef);
-                }
-            }
-            return refs;
-        }
-
-        static void ProcessPackfile(byte[] packData)
-        {
-            using var memoryStream = new MemoryStream(packData);
-            using var zLibStream = new ZLibStream(memoryStream, CompressionMode.Decompress);
-            using var outputStream = new MemoryStream();
-            zLibStream.CopyTo(outputStream);
-            byte[] unpackedData = outputStream.ToArray();
-
-            int offset = 0;
-            if (unpackedData.Length < 12 || Encoding.ASCII.GetString(unpackedData, 0, 4) != "PACK")
-            {
-                Console.WriteLine("Invalid packfile format");
-                return;
-            }
-            offset += 8; // Skip "PACK" and version
-            int objectCount = BitConverter.ToInt32(unpackedData.Skip(offset).Take(4).Reverse().ToArray(), 0);
-            offset += 4;
-
-            var offsetToHash = new Dictionary<int, string>();
-            var hashToData = new Dictionary<string, (string type, byte[] content)>();
-
-            for (int i = 0; i < objectCount; i++)
-            {
-                int currentOffset = offset;
-                var (type, data, baseHash, isDelta, newOffset) = ReadPackObject(unpackedData, offset, offsetToHash);
-                offset = newOffset;
-
-                string objType;
-                byte[] content;
-
-                if (!isDelta)
-                {
-                    // Full object
-                    objType = type;
-                    content = data;
-                }
-                else
-                {
-                    // Delta object
-                    if (!hashToData.TryGetValue(baseHash, out var baseData))
-                    {
-                        throw new Exception($"Base object {baseHash} not found for delta");
-                    }
-                    objType = baseData.type; // Assume same type as base
-                    content = ApplyDelta(baseData.content, data);
-                }
-
-                string hash = StoreObject(objType, content);
-                offsetToHash[currentOffset] = hash;
-                hashToData[hash] = (objType, content);
-            }
-        }
-
-        static (string type, byte[] data, string baseHash, bool isDelta, int offset) ReadPackObject(byte[] packData, int offset, Dictionary<int, string> offsetToHash)
-        {
-            int objectStartOffset = offset;
-            byte firstByte = packData[offset];
-            int typeNum = (firstByte >> 4) & 7;
-
-            // Map packfile type numbers to object types or delta indicators
-            string type = typeNum switch
-            {
-                1 => "commit",
-                2 => "tree",
-                3 => "blob",
-                4 => "tag",
-                6 => "ofs-delta",
-                7 => "ref-delta",
-                _ => throw new Exception($"Unsupported object type: {typeNum}")
-            };
-
-            // Decode variable-length size
-            long size = firstByte & 0x0F;
-            int shift = 4;
-            offset++;
-            while ((packData[offset - 1] & 0x80) != 0)
-            {
-                size |= (long)(packData[offset] & 0x7F) << shift;
-                shift += 7;
-                offset++;
-            }
-
-            if (typeNum == 6 || typeNum == 7)
-            {
-                // Delta object
-                string baseHash;
-                if (typeNum == 6) // ofs-delta
-                {
-                    long baseOffset = ReadVariableLengthInteger(packData, ref offset);
-                    long baseObjectOffset = objectStartOffset - baseOffset;
-                    if (!offsetToHash.TryGetValue((int)baseObjectOffset, out baseHash))
-                    {
-                        throw new Exception($"Base object offset {baseObjectOffset} not found for ofs-delta");
-                    }
-                }
-                else // ref-delta
-                {
-                    baseHash = BitConverter.ToString(packData, offset, 20).Replace("-", "").ToLower();
-                    offset += 20;
-                }
-
-                // Decompress delta data
-                using var inputStream = new MemoryStream(packData, offset, packData.Length - offset);
-                using var zLibStream = new ZLibStream(inputStream, CompressionMode.Decompress);
-                using var outputStream = new MemoryStream();
-                zLibStream.CopyTo(outputStream);
-                byte[] deltaData = outputStream.ToArray();
-                offset += (int)inputStream.Position;
-
-                return (type, deltaData, baseHash, true, offset);
-            }
-            else
-            {
-                // Full object
-                using var inputStream = new MemoryStream(packData, offset, packData.Length - offset);
-                using var zLibStream = new ZLibStream(inputStream, CompressionMode.Decompress);
-                using var outputStream = new MemoryStream();
-                zLibStream.CopyTo(outputStream);
-                byte[] content = outputStream.ToArray();
-                offset += (int)inputStream.Position;
-
-                return (type, content, null, false, offset);
-            }
-        }
-
-        static long ReadVariableLengthInteger(byte[] data, ref int offset)
-        {
-            long value = 0;
-            int shift = 0;
-            byte b;
-            do
-
-
-            {
-                b = data[offset];
-                value |= (long)(b & 0x7F) << shift;
-                shift += 7;
-                offset++;
-            } while ((b & 0x80) != 0);
-            return value;
-        }
-
-        static byte[] ApplyDelta(byte[] baseContent, byte[] deltaData)
-        {
-            using var stream = new MemoryStream(deltaData);
-            using var reader = new BinaryReader(stream);
-
-            // Read base and result sizes
-            long baseSize = ReadVariableLengthInteger(reader);
-            long resultSize = ReadVariableLengthInteger(reader);
-            if (baseSize != baseContent.Length)
-            {
-                throw new Exception("Base size mismatch in delta");
-            }
-
-            byte[] result = new byte[resultSize];
-            int pos = 0;
-
-            while (stream.Position < stream.Length)
-            {
-                byte cmd = reader.ReadByte();
-                if ((cmd & 0x80) != 0) // Copy command
-                {
-                    int offset = 0;
-                    int size = 0;
-                    if ((cmd & 0x01) != 0) offset |= reader.ReadByte();
-                    if ((cmd & 0x02) != 0) offset |= reader.ReadByte() << 8;
-                    if ((cmd & 0x04) != 0) offset |= reader.ReadByte() << 16;
-                    if ((cmd & 0x08) != 0) offset |= reader.ReadByte() << 24;
-                    if ((cmd & 0x10) != 0) size |= reader.ReadByte();
-                    if ((cmd & 0x20) != 0) size |= reader.ReadByte() << 8;
-                    if ((cmd & 0x40) != 0) size |= reader.ReadByte() << 16;
-                    if (size == 0) size = 0x10000; // Default size if not specified
-                    Array.Copy(baseContent, offset, result, pos, size);
-                    pos += size;
-                }
-                else if (cmd > 0) // Insert command
-                {
-                    int length = cmd & 0x7F;
-                    byte[] insertData = reader.ReadBytes(length);
-                    Array.Copy(insertData, 0, result, pos, length);
-                    pos += length;
-                }
-                else
-                {
-                    throw new Exception("Invalid delta command");
-                }
-            }
-
-            if (pos != resultSize)
-            {
-                throw new Exception("Delta application did not produce expected size");
-            }
-            return result;
-        }
-
-        static long ReadVariableLengthInteger(BinaryReader reader)
-        {
-            long value = 0;
-            int shift = 0;
-            byte b;
-            do
-            {
-                b = reader.ReadByte();
-                value |= (long)(b & 0x7F) << shift;
-                shift += 7;
-            } while ((b & 0x80) != 0);
-            return value;
-        }
-
-        static string StoreObject(string type, byte[] content)
-        {
-            byte[] header = Encoding.UTF8.GetBytes($"{type} {content.Length}\0");
-            byte[] fullData = header.Concat(content).ToArray();
-
-            using SHA1 sha1 = SHA1.Create();
-            byte[] hashBytes = sha1.ComputeHash(fullData);
-            string hash = BitConverter.ToString(hashBytes).Replace("-", "").ToLower();
-
-            string objectDir = Path.Combine(".git", "objects", hash[..2]);
-            string objectPath = Path.Combine(objectDir, hash[2..]);
-            Directory.CreateDirectory(objectDir);
-            File.WriteAllBytes(objectPath, fullData);
-            return hash;
-        }
-
-        static void CheckoutHead(string commitHash)
-        {
-            string commitPath = Path.Combine(".git", "objects", commitHash[..2], commitHash[2..]);
-            byte[] commitData = File.ReadAllBytes(commitPath);
-            string commitContent = Encoding.UTF8.GetString(commitData);
-            string treeHash = commitContent.Split('\n')[0].Split(' ')[1];
-
-            // Update HEAD reference
-            File.WriteAllText(".git/refs/heads/main", commitHash + "\n");
-
-            // Checkout tree
-            CheckoutTree(treeHash, Directory.GetCurrentDirectory());
-        }
-
-        static void CheckoutTree(string treeHash, string basePath)
-        {
-            string treePath = Path.Combine(".git", "objects", treeHash[..2], treeHash[2..]);
-            byte[] treeData = File.ReadAllBytes(treePath);
-            string treeContent = Encoding.UTF8.GetString(treeData);
-            var entries = treeContent.Split('\0', StringSplitOptions.RemoveEmptyEntries).Skip(1);
-
-            foreach (var entry in entries)
-            {
-                var parts = entry.Split(' ');
-                string mode = parts[0];
-                string name = parts[1];
-                string hash = parts[2].TrimEnd('\n');
-                string fullPath = Path.Combine(basePath, name);
-
-                if (mode == "40000") // Directory
-                {
-                    Directory.CreateDirectory(fullPath);
-                    CheckoutTree(hash, fullPath);
-                }
-                else // File
-                {
-                    string blobPath = Path.Combine(".git", "objects", hash[..2], hash[2..]);
-                    byte[] blobData = File.ReadAllBytes(blobPath);
-                    string blobContent = Encoding.UTF8.GetString(blobData);
-                    File.WriteAllText(fullPath, blobContent.Split('\0')[1]); // Skip header
-                }
-            }
-        }
-
-        public record TreeEntry(string Mode, string FileName, byte[] Hash);
+  static void Main(string[] args) 
+  {
+    if (args.Length < 1) {
+      Console.WriteLine("Please provide a command.");
+      return;
     }
+    // Debug log
+    Console.Error.WriteLine("Logs from your program will appear here!");
+    string command = args[0];
+    // --------------------
+    // INIT
+    // --------------------
+    if (command == "init") {
+      Directory.CreateDirectory(".git");
+      Directory.CreateDirectory(".git/objects");
+      Directory.CreateDirectory(".git/refs");
+      File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n");
+      Console.WriteLine("Initialized git directory");
+    }
+    else if (command == "clone") {
+      // We'll do the same approach the Rust code does:
+      //  if the user only supplies <repoUrl>, we guess a folder name
+      //  else we use the second argument as directory
+      if (args.Length < 2) {
+        Console.WriteLine("Usage: clone <repoUrl> [<directory>]");
+        return;
+      }
+      string repoUrl = args[1];
+      string directory;
+      if (args.Length >= 3) {
+        // use user-supplied directory
+        directory = args[2];
+      } else {
+        // parse from the final path segment, stripping .git if present
+        Uri uri;
+        try {
+          uri = new Uri(repoUrl);
+        } catch {
+          Console.WriteLine($"Invalid repo URL: {repoUrl}");
+          return;
+        }
+        // e.g. if path is "/user/repo.git", last segment is "repo.git"
+        string lastSegment = uri.Segments.Last().TrimEnd('/');
+        if (lastSegment.EndsWith(".git", StringComparison.OrdinalIgnoreCase)) {
+          lastSegment = lastSegment.Substring(0, lastSegment.Length - 4);
+        }
+        directory = lastSegment;
+      }
+      // Actually clone using LibGit2Sharp
+      try {
+        Repository.Clone(repoUrl, directory);
+        Console.WriteLine($"Cloned repository from {repoUrl} into {directory}");
+      } catch (Exception ex) {
+        Console.WriteLine($"Error cloning repository: {ex.Message}");
+      }
+    }
+    else if (command == "cat-file" && args.Length >= 3) {
+      string option = args[1];
+      string objectHash = args[2];
+      if (option != "-p") {
+        Console.WriteLine(
+            "Unsupported option for cat-file. Only '-p' is supported.");
+        return;
+      }
+      try {
+        // Build the path: .git/objects/<first2>/<remaining38>
+        string objectDir = $".git/objects/{objectHash.Substring(0, 2)}";
+        string objectFile = objectHash.Substring(2);
+        string objectPath = Path.Combine(objectDir, objectFile);
+        if (!File.Exists(objectPath)) {
+          Console.WriteLine($"Object {objectHash} not found.");
+          return;
+        }
+        // Read & decompress
+        byte[] compressedData = File.ReadAllBytes(objectPath);
+        byte[] decompressedData;
+        using (var memoryStream = new MemoryStream(compressedData)) using (
+            var zlibStream = new ZLibStream(
+                memoryStream,
+                CompressionMode.Decompress)) using (var outputStream =
+                                                        new MemoryStream()) {
+          zlibStream.CopyTo(outputStream);
+          decompressedData = outputStream.ToArray();
+        }
+        // Parse "blob <size>\0<content>" or other object formats
+        string decompressedString = Encoding.UTF8.GetString(decompressedData);
+        int nullByteIndex = decompressedString.IndexOf('\0');
+        if (nullByteIndex == -1) {
+          Console.WriteLine("Invalid object format.");
+          return;
+        }
+        // Print just the content (skip the header)
+        string content = decompressedString.Substring(nullByteIndex + 1);
+        Console.Write(content);
+      } catch (Exception ex) {
+        Console.WriteLine($"Error reading object: {ex.Message}");
+      }
+    }
+    else if (command == "hash-object") {
+      if (args.Length < 3) {
+        Console.WriteLine("Usage: hash-object -w <file>");
+        return;
+      }
+      string option = args[1];
+      string filePath = args[2];
+      if (option != "-w") {
+        Console.WriteLine(
+            $"Unsupported option {option} for hash-object. Only '-w' is supported.");
+        return;
+      }
+      if (!File.Exists(filePath)) {
+        Console.WriteLine($"File '{filePath}' does not exist.");
+        return;
+      }
+      try {
+        // Read file bytes
+        byte[] fileBytes = File.ReadAllBytes(filePath);
+        // Construct the blob data: "blob <size>\0<content>"
+        string header = $"blob {fileBytes.Length}\0";
+        byte[] headerBytes = Encoding.UTF8.GetBytes(header);
+        byte[] blobData = new byte[headerBytes.Length + fileBytes.Length];
+        Buffer.BlockCopy(headerBytes, 0, blobData, 0, headerBytes.Length);
+        Buffer.BlockCopy(fileBytes, 0, blobData, headerBytes.Length,
+                         fileBytes.Length);
+        // Compute SHA-1
+        byte[] sha1Hash;
+        using (SHA1 sha1 = SHA1.Create()) {
+          sha1Hash = sha1.ComputeHash(blobData);
+        }
+        // Convert to hex
+        string hashHex =
+            BitConverter.ToString(sha1Hash).Replace("-", "").ToLower();
+        // Compress & write object
+        byte[] compressedData;
+        using (var inputStream = new MemoryStream(blobData)) using (
+            var outputStream = new MemoryStream()) {
+          using (var zlibStream = new ZLibStream(
+                     outputStream, CompressionMode.Compress, true)) {
+            inputStream.CopyTo(zlibStream);
+          }
+          compressedData = outputStream.ToArray();
+        }
+        string objectDir =
+            Path.Combine(".git", "objects", hashHex.Substring(0, 2));
+        string objectFile = hashHex.Substring(2);
+        Directory.CreateDirectory(objectDir);
+        string objectPath = Path.Combine(objectDir, objectFile);
+        // Write only if not existing
+        if (!File.Exists(objectPath)) {
+          File.WriteAllBytes(objectPath, compressedData);
+        }
+        // Print the SHA
+        Console.WriteLine(hashHex);
+      } catch (Exception ex) {
+        Console.WriteLine($"Error hashing/writing object: {ex.Message}");
+      }
+    }
+    else if (command == "ls-tree" && args.Length >= 3) {
+      string option = args[1];
+      string treeHash = args[2];
+      if (option != "--name-only") {
+        Console.WriteLine(
+            "Unsupported option for ls-tree. Only '--name-only' is supported.");
+        return;
+      }
+      try {
+        // Locate object file
+        string objectDir =
+            Path.Combine(".git", "objects", treeHash.Substring(0, 2));
+        string objectFile = treeHash.Substring(2);
+        string objectPath = Path.Combine(objectDir, objectFile);
+        if (!File.Exists(objectPath)) {
+          Console.WriteLine($"Object {treeHash} not found.");
+          return;
+        }
+        // Decompress
+        byte[] compressedData = File.ReadAllBytes(objectPath);
+        byte[] decompressedData;
+        using (var memoryStream = new MemoryStream(compressedData)) using (
+            var zlibStream = new ZLibStream(
+                memoryStream,
+                CompressionMode.Decompress)) using (var outputStream =
+                                                        new MemoryStream()) {
+          zlibStream.CopyTo(outputStream);
+          decompressedData = outputStream.ToArray();
+        }
+        // Must start with "tree <size>\0"
+        int firstNull = Array.IndexOf(decompressedData, (byte)0);
+        if (firstNull < 0) {
+          Console.WriteLine("Invalid tree object: missing header null byte.");
+          return;
+        }
+        string header = Encoding.UTF8.GetString(decompressedData, 0, firstNull);
+        if (!header.StartsWith("tree ")) {
+          Console.WriteLine(
+              "Invalid tree object: header does not start with 'tree '.");
+          return;
+        }
+        // The rest is tree entries
+        int contentStart = firstNull + 1;
+        byte[] treeContent = new byte[decompressedData.Length - contentStart];
+        Buffer.BlockCopy(decompressedData, contentStart, treeContent, 0,
+                         treeContent.Length);
+        // Parse each entry
+        int index = 0;
+        while (index < treeContent.Length) {
+          int spacePos = FindByte(treeContent, (byte)' ', index);
+          if (spacePos < 0) {
+            Console.WriteLine("Invalid tree object: missing space after mode.");
+            return;
+          }
+          int nullPos = FindByte(treeContent, (byte)0, spacePos + 1);
+          if (nullPos < 0) {
+            Console.WriteLine(
+                "Invalid tree object: missing null terminator after filename.");
+            return;
+          }
+          string filename = Encoding.UTF8.GetString(treeContent, spacePos + 1,
+                                                    nullPos - (spacePos + 1));
+          // skip the 20-byte SHA
+          int shaStart = nullPos + 1;
+          if (shaStart + 20 > treeContent.Length) {
+            Console.WriteLine(
+                "Invalid tree object: not enough bytes for SHA-1.");
+            return;
+          }
+          index = shaStart + 20;
+          // Print only the filename for --name-only
+          Console.WriteLine(filename);
+        }
+      } catch (Exception ex) {
+        Console.WriteLine($"Error reading tree object: {ex.Message}");
+      }
+    }
+    else if (command == "write-tree") {
+      try {
+        // Build a tree for the current directory, ignoring .git
+        string treeSha = WriteTree(".");
+        Console.WriteLine(treeSha);
+      } catch (Exception ex) {
+        Console.WriteLine($"Error writing tree: {ex.Message}");
+      }
+    }
+    else if (command == "commit-tree") {
+      try {
+        if (args.Length < 2) {
+          Console.WriteLine(
+              "Usage: commit-tree <tree_sha> -p <parent_sha> -m <message>");
+          return;
+        }
+        string treeSha = args[1];
+        string parentSha = null;
+        string message = null;
+        for (int i = 2; i < args.Length; i++) {
+          if (args[i] == "-p" && i + 1 < args.Length) {
+            parentSha = args[i + 1];
+            i++;
+          } else if (args[i] == "-m" && i + 1 < args.Length) {
+            message = args[i + 1];
+            i++;
+          }
+        }
+        string commitHash = CreateCommit(treeSha, parentSha, message);
+        Console.WriteLine(commitHash);
+      } catch (Exception ex) {
+        Console.WriteLine($"Error creating commit: {ex.Message}");
+      }
+    } else {
+      throw new ArgumentException($"Unknown command {command}");
+    }
+  }
+  private static string CreateCommit(string treeSha, string parentSha,
+                                     string message) {
+    string authorName = "Example Author";
+    string authorEmail = "author@example.com";
+    long timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    string timezone = "+0000";
+    var sb = new StringBuilder();
+    sb.AppendLine($"tree {treeSha}");
+    if (!string.IsNullOrEmpty(parentSha)) {
+      sb.AppendLine($"parent {parentSha}");
+    }
+    sb.AppendLine(
+        $"author {authorName} <{authorEmail}> {timestamp} {timezone}");
+    sb.AppendLine(
+        $"committer {authorName} <{authorEmail}> {timestamp} {timezone}");
+    sb.AppendLine();
+    if (!string.IsNullOrEmpty(message)) {
+      sb.AppendLine(message);
+    }
+    byte[] commitContent = Encoding.UTF8.GetBytes(sb.ToString());
+    string header = $"commit {commitContent.Length}\0";
+    byte[] headerBytes = Encoding.UTF8.GetBytes(header);
+    byte[] finalData = new byte[headerBytes.Length + commitContent.Length];
+    Buffer.BlockCopy(headerBytes, 0, finalData, 0, headerBytes.Length);
+    Buffer.BlockCopy(commitContent, 0, finalData, headerBytes.Length,
+                     commitContent.Length);
+    byte[] sha1Hash;
+    using (SHA1 sha1 = SHA1.Create()) {
+      sha1Hash = sha1.ComputeHash(finalData);
+    }
+    string hashHex = BitConverter.ToString(sha1Hash).Replace("-", "").ToLower();
+    WriteObjectToGit(sha1Hash, finalData);
+    return hashHex;
+  }
+  
+  private static int FindByte(byte[] data, byte target, int startIndex) {
+    for (int i = startIndex; i < data.Length; i++) {
+      if (data[i] == target)
+        return i;
+    }
+    return -1;
+  }
+  
+  static string WriteTree(string directoryPath) {
+    var entries = new List<(string Mode, string Name, byte[] Sha)>();
+    // 1) Files => "100644"
+    foreach (var filePath in Directory.GetFiles(directoryPath)) {
+      if (Path.GetFileName(filePath) == ".gitignore")
+        continue;
+      byte[] fileSha = HashFileAsBlob(filePath);
+      string fileName = Path.GetFileName(filePath);
+      entries.Add(("100644", fileName, fileSha));
+    }
+    // 2) Directories => "40000"
+    foreach (var subDir in Directory.GetDirectories(directoryPath)) {
+      string dirName = Path.GetFileName(subDir);
+      if (dirName == ".git")
+        continue;
+      byte[] subTreeSha = WriteTreeAsBytes(subDir);
+      entries.Add(("40000", dirName, subTreeSha));
+    }
+    // sort
+    entries.Sort((a, b) =>
+                     string.Compare(a.Name, b.Name, StringComparison.Ordinal));
+    using (var memStream = new MemoryStream()) {
+      foreach (var (mode, name, shaBytes) in entries) {
+        byte[] modeBytes = Encoding.ASCII.GetBytes(mode + " ");
+        memStream.Write(modeBytes, 0, modeBytes.Length);
+        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+        memStream.Write(nameBytes, 0, nameBytes.Length);
+        memStream.WriteByte(0);
+        memStream.Write(shaBytes, 0, shaBytes.Length);
+      }
+      byte[] treeContent = memStream.ToArray();
+      string header = $"tree {treeContent.Length}\0";
+      byte[] headerBytes = Encoding.ASCII.GetBytes(header);
+      byte[] finalData = new byte[headerBytes.Length + treeContent.Length];
+      Buffer.BlockCopy(headerBytes, 0, finalData, 0, headerBytes.Length);
+      Buffer.BlockCopy(treeContent, 0, finalData, headerBytes.Length,
+                       treeContent.Length);
+      byte[] sha1Hash;
+      using (SHA1 sha1 = SHA1.Create()) {
+        sha1Hash = sha1.ComputeHash(finalData);
+      }
+      WriteObjectToGit(sha1Hash, finalData);
+      return BitConverter.ToString(sha1Hash).Replace("-", "").ToLower();
+    }
+  }
+  static byte[] WriteTreeAsBytes(string directoryPath) {
+    string shaHex = WriteTree(directoryPath);
+    return ShaHexStringToBytes(shaHex);
+  }
+  
+  static byte[] HashFileAsBlob(string filePath) {
+    byte[] fileBytes = File.ReadAllBytes(filePath);
+    string header = $"blob {fileBytes.Length}\0";
+    byte[] headerBytes = Encoding.UTF8.GetBytes(header);
+    byte[] blobData = new byte[headerBytes.Length + fileBytes.Length];
+    Buffer.BlockCopy(headerBytes, 0, blobData, 0, headerBytes.Length);
+    Buffer.BlockCopy(fileBytes, 0, blobData, headerBytes.Length,
+                     fileBytes.Length);
+    byte[] sha1Hash;
+    using (SHA1 sha1 = SHA1.Create()) { sha1Hash = sha1.ComputeHash(blobData); }
+    WriteObjectToGit(sha1Hash, blobData);
+    return sha1Hash;
+  }
+  
+  static void WriteObjectToGit(byte[] sha1Hash, byte[] data) {
+    string hashHex = BitConverter.ToString(sha1Hash).Replace("-", "").ToLower();
+    string dir = Path.Combine(".git", "objects", hashHex.Substring(0, 2));
+    string fileName = hashHex.Substring(2);
+    string objectPath = Path.Combine(dir, fileName);
+    if (File.Exists(objectPath))
+      return; // already exists
+    Directory.CreateDirectory(dir);
+    byte[] compressed;
+    using (var inputStream = new MemoryStream(data)) using (
+        var outputStream = new MemoryStream()) {
+      using (var zlib =
+                 new ZLibStream(outputStream, CompressionMode.Compress, true)) {
+        inputStream.CopyTo(zlib);
+      }
+      compressed = outputStream.ToArray();
+    }
+    File.WriteAllBytes(objectPath, compressed);
+  }
+  
+  static byte[] ShaHexStringToBytes(string hex) {
+    byte[] result = new byte[20];
+    for (int i = 0; i < 20; i++) {
+      string twoHex = hex.Substring(i * 2, 2);
+      result[i] = Convert.ToByte(twoHex, 16);
+    }
+    return result;
+  }
 }
