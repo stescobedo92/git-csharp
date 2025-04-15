@@ -175,152 +175,154 @@ public class Program
             }
         }
         // --- Clone Command Implementation ---
-else if (command == "clone")
-{
-    if (args.Length < 3)
-    {
-        Console.WriteLine("Usage: clone <repository_url> <target_directory>");
-        return;
-    }
-
-    string repoUrl = args[1].TrimEnd('/'); // Ensure no trailing slash
-    string targetDir = args[2];
-
-    if (Directory.Exists(targetDir))
-    {
-        if (Directory.EnumerateFileSystemEntries(targetDir).Any())
+        else if (command == "clone")
         {
-            Console.Error.WriteLine($"Error: Target directory '{targetDir}' exists and is not empty.");
-            return;
+            if (args.Length < 3)
+            {
+                Console.WriteLine("Usage: clone <repository_url> <target_directory>");
+                return;
+            }
+
+            string repoUrl = args[1].TrimEnd('/'); // Ensure no trailing slash
+            string targetDir = args[2];
+
+            if (Directory.Exists(targetDir))
+            {
+                if (Directory.EnumerateFileSystemEntries(targetDir).Any())
+                {
+                    Console.Error.WriteLine($"Error: Target directory '{targetDir}' exists and is not empty.");
+                    return;
+                }
+            }
+            else
+            {
+                Directory.CreateDirectory(targetDir);
+            }
+
+            string originalDirectory = Directory.GetCurrentDirectory();
+            try
+            {
+                Directory.SetCurrentDirectory(targetDir);
+
+                Directory.CreateDirectory(".git");
+                Directory.CreateDirectory(".git/objects");
+                Directory.CreateDirectory(".git/refs");
+                Directory.CreateDirectory(".git/refs/heads");
+                File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n");
+
+                Console.WriteLine($"Cloning into '{Path.GetFileName(targetDir)}'...");
+
+                using (var client = new HttpClient())
+                {
+                    client.DefaultRequestHeaders.UserAgent.ParseAdd("git/2.30.0");
+                    client.DefaultRequestHeaders.Accept.ParseAdd("application/x-git-upload-pack-result");
+
+                    // --- Step 1: Discover references ---
+                    string infoRefsUrl = $"{repoUrl}/info/refs?service=git-upload-pack";
+                    Console.WriteLine($"Fetching refs from {infoRefsUrl}");
+                    HttpResponseMessage infoRefsResponse = await client.GetAsync(infoRefsUrl);
+
+                    if (!infoRefsResponse.IsSuccessStatusCode)
+                    {
+                        Console.Error.WriteLine($"Failed to fetch refs: {infoRefsResponse.StatusCode}");
+                        string errorContent = await infoRefsResponse.Content.ReadAsStringAsync();
+                        Console.Error.WriteLine($"Server response: {errorContent}");
+                        return;
+                    }
+
+                    using var infoRefsStream = await infoRefsResponse.Content.ReadAsStreamAsync();
+                    var refs = await ParseInfoRefs(infoRefsStream);
+
+                    if (!refs.Any())
+                    {
+                        Console.Error.WriteLine("No refs found.");
+                        return;
+                    }
+
+                    string? headCommit = null;
+                    string? headRefName = null;
+                    if (refs.TryGetValue("HEAD", out string headTargetRef) && refs.TryGetValue(headTargetRef, out string targetCommit))
+                    {
+                        headCommit = targetCommit;
+                        headRefName = headTargetRef;
+                    }
+                    else if (refs.TryGetValue("refs/heads/main", out string mainCommit))
+                    {
+                        headCommit = mainCommit;
+                        headRefName = "refs/heads/main";
+                    }
+                    else if (refs.TryGetValue("refs/heads/master", out string masterCommit))
+                    {
+                        headCommit = masterCommit;
+                        headRefName = "refs/heads/master";
+                    }
+
+                    if (string.IsNullOrEmpty(headCommit) || string.IsNullOrEmpty(headRefName))
+                    {
+                        Console.Error.WriteLine("Could not determine HEAD commit or ref name from available refs:");
+                        foreach (var kvp in refs) Console.WriteLine($"- {kvp.Value} {kvp.Key}");
+                        return;
+                    }
+
+                    Console.WriteLine($"Determined HEAD commit: {headCommit} ({headRefName})");
+
+                    // Null-forgiving operator used here to silence the compiler's null warning
+                    File.WriteAllText(".git/HEAD", $"ref: {headRefName!}\n");
+
+                    // --- Step 2: Negotiate and fetch packfile ---
+                    string uploadPackUrl = $"{repoUrl}/git-upload-pack";
+                    Console.WriteLine($"Requesting packfile from {uploadPackUrl}");
+
+                    // Fix: Create proper git protocol request with correct pkt-line format
+                    StringBuilder sb = new StringBuilder();
+                    string wantLine = $"want {headCommit}\n";
+                    sb.Append($"{wantLine.Length + 4:x4}{wantLine}");
+                    sb.Append("0000"); // Flush packet
+                    sb.Append("0009done\n");
+                    
+                    string requestBody = sb.ToString();
+                    Console.WriteLine($"DEBUG: Sending request body (pkt-line):{requestBody.Replace("\n", "\\n")}");
+
+                    var content = new StringContent(requestBody, Encoding.UTF8, "application/x-git-upload-pack-request");
+                    HttpResponseMessage packResponse = await client.PostAsync(uploadPackUrl, content);
+
+                    if (!packResponse.IsSuccessStatusCode)
+                    {
+                        Console.Error.WriteLine($"Failed to fetch pack: {packResponse.StatusCode}"); 
+                        string errorContent = await packResponse.Content.ReadAsStringAsync();
+                        Console.Error.WriteLine($"Server response: {errorContent}");
+                        return;
+                    }
+
+                    // --- Step 3: Process packfile ---
+                    Console.WriteLine("Receiving packfile...");
+                    using var packStream = await packResponse.Content.ReadAsStreamAsync();
+                    
+                    // Skip the pkt-line formatted response headers to get to the actual packfile
+                    await SkipPackResponseHeaders(packStream);
+                    
+                    // Now process the actual packfile
+                    await ProcessPackfile(packStream);
+
+                    // --- Step 4: Checkout HEAD ---
+                    Console.WriteLine($"Checking out commit {headCommit}");
+                    CheckoutHead(headCommit);
+
+                    Console.WriteLine($"Successfully cloned repository to {targetDir}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"An error occurred during clone: {ex.Message}");
+                Console.Error.WriteLine(ex.StackTrace);
+            }
+            finally
+            {
+                Directory.SetCurrentDirectory(originalDirectory);
+                _packObjectsByOffset.Clear();
+                _packObjectsByHash.Clear();
+            }
         }
-    }
-    else
-    {
-        Directory.CreateDirectory(targetDir);
-    }
-
-    string originalDirectory = Directory.GetCurrentDirectory();
-    try
-    {
-        Directory.SetCurrentDirectory(targetDir);
-
-        Directory.CreateDirectory(".git");
-        Directory.CreateDirectory(".git/objects");
-        Directory.CreateDirectory(".git/refs");
-        Directory.CreateDirectory(".git/refs/heads");
-        File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n");
-
-        Console.WriteLine($"Cloning into '{Path.GetFileName(targetDir)}'...");
-
-        using (var client = new HttpClient())
-        {
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("git/2.30.0"); // More standard Git user agent
-            client.DefaultRequestHeaders.Accept.ParseAdd("application/x-git-upload-pack-result");
-
-            // --- Step 1: Discover references ---
-            string infoRefsUrl = $"{repoUrl}/info/refs?service=git-upload-pack";
-            Console.WriteLine($"Fetching refs from {infoRefsUrl}");
-            HttpResponseMessage infoRefsResponse = await client.GetAsync(infoRefsUrl);
-
-            if (!infoRefsResponse.IsSuccessStatusCode)
-            {
-                Console.Error.WriteLine($"Failed to fetch refs: {infoRefsResponse.StatusCode}");
-                string errorContent = await infoRefsResponse.Content.ReadAsStringAsync();
-                Console.Error.WriteLine($"Server response: {errorContent}");
-                return;
-            }
-
-            using var infoRefsStream = await infoRefsResponse.Content.ReadAsStreamAsync();
-            var refs = await ParseInfoRefs(infoRefsStream);
-
-            if (!refs.Any())
-            {
-                Console.Error.WriteLine("No refs found.");
-                return;
-            }
-
-            string? headCommit = null;
-            string? headRefName = null;
-            if (refs.TryGetValue("HEAD", out string headTargetRef) && refs.TryGetValue(headTargetRef, out string targetCommit))
-            {
-                headCommit = targetCommit;
-                headRefName = headTargetRef;
-            }
-            else if (refs.TryGetValue("refs/heads/main", out string mainCommit))
-            {
-                headCommit = mainCommit;
-                headRefName = "refs/heads/main";
-            }
-            else if (refs.TryGetValue("refs/heads/master", out string masterCommit))
-            {
-                headCommit = masterCommit;
-                headRefName = "refs/heads/master";
-            }
-
-            if (string.IsNullOrEmpty(headCommit) || string.IsNullOrEmpty(headRefName))
-            {
-                Console.Error.WriteLine("Could not determine HEAD commit or ref name from available refs:");
-                foreach (var kvp in refs) Console.WriteLine($"- {kvp.Value} {kvp.Key}");
-                return;
-            }
-
-            Console.WriteLine($"Determined HEAD commit: {headCommit} ({headRefName})");
-
-            // Null-forgiving operator used here to silence the compiler's null warning
-            File.WriteAllText(".git/HEAD", $"ref: {headRefName!}\n");
-
-            // --- Step 2: Negotiate and fetch packfile ---
-            string uploadPackUrl = $"{repoUrl}/git-upload-pack";
-            Console.WriteLine($"Requesting packfile from {uploadPackUrl}");
-
-            // Fix: Create proper git protocol request
-            // Format the packet line with the correct length prefix (4 hex digits)
-            string wantLine = $"want {headCommit}\n";
-            StringBuilder sb = new StringBuilder();
-            // Send the length as 4-digit hex including the 4 bytes of the length itself
-            sb.Append($"{wantLine.Length + 4:x4}{wantLine}");
-            // Add a flush packet and "done" command
-            sb.Append("0000");
-            sb.Append($"0009done\n");
-            
-            string requestBody = sb.ToString();
-            Console.WriteLine($"DEBUG: Sending request body (pkt-line):{requestBody.Replace("\n", "\\n")}"); // Debug output
-
-            var content = new StringContent(requestBody, Encoding.UTF8, "application/x-git-upload-pack-request");
-            HttpResponseMessage packResponse = await client.PostAsync(uploadPackUrl, content);
-
-            if (!packResponse.IsSuccessStatusCode)
-            {
-                Console.Error.WriteLine($"Failed to fetch pack: {packResponse.StatusCode}"); 
-                string errorContent = await packResponse.Content.ReadAsStringAsync();
-                Console.Error.WriteLine($"Server response: {errorContent}");
-                return;
-            }
-
-            // --- Step 3: Process packfile ---
-            Console.WriteLine("Receiving packfile...");
-            using var packStream = await packResponse.Content.ReadAsStreamAsync();
-            await ProcessPackfile(packStream); // Process the stream
-
-            // --- Step 4: Checkout HEAD ---
-            Console.WriteLine($"Checking out commit {headCommit}");
-            CheckoutHead(headCommit);
-
-            Console.WriteLine($"Successfully cloned repository to {targetDir}");
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.Error.WriteLine($"An error occurred during clone: {ex.Message}");
-        Console.Error.WriteLine(ex.StackTrace);
-    }
-    finally
-    {
-        Directory.SetCurrentDirectory(originalDirectory);
-        _packObjectsByOffset.Clear();
-        _packObjectsByHash.Clear();
-    }
-}
         else
         {
             Console.Error.WriteLine($"Unknown command {command}");
@@ -328,6 +330,75 @@ else if (command == "clone")
     }
 
     // --- Helper Methods ---
+    
+    static async Task SkipPackResponseHeaders(Stream stream)
+    {
+        byte[] headerBuffer = new byte[4];
+        
+        // Read pkt-lines until we find the packfile signature "PACK"
+        while (true)
+        {
+            // Read the length header
+            int totalRead = 0;
+            while (totalRead < 4)
+            {
+                int read = await stream.ReadAsync(headerBuffer, totalRead, 4 - totalRead);
+                if (read == 0) throw new EndOfStreamException("Unexpected end of stream while reading pkt-line header");
+                totalRead += read;
+            }
+            
+            // Check if we've found the PACK signature
+            if (Encoding.ASCII.GetString(headerBuffer) == "PACK")
+            {
+                // Backtrack 4 bytes since we read the PACK signature
+                if (stream.CanSeek)
+                {
+                    stream.Seek(-4, SeekOrigin.Current);
+                }
+                else
+                {
+                    // For non-seekable streams, we need to remember the first 4 bytes
+                    // This is handled by a custom buffered stream that we'd need to implement
+                    // For simplicity, we'll assume the stream is seekable in this example
+                    throw new NotSupportedException("Stream must be seekable to process packfile response");
+                }
+                return;
+            }
+            
+            // Convert the hex length to an integer
+            if (!int.TryParse(Encoding.ASCII.GetString(headerBuffer), System.Globalization.NumberStyles.HexNumber, null, out int length))
+            {
+                throw new InvalidDataException($"Invalid pkt-line length: {Encoding.ASCII.GetString(headerBuffer)}");
+            }
+            
+            if (length < 4)
+            {
+                throw new InvalidDataException($"Invalid pkt-line length value: {length}");
+            }
+            
+            if (length == 4)
+            {
+                // This is a flush packet (0000), continue reading
+                continue;
+            }
+            
+            // Skip the remaining data in this pkt-line
+            int remainingBytes = length - 4;
+            await SkipBytes(stream, remainingBytes);
+        }
+    }
+
+    static async Task SkipBytes(Stream stream, int bytesToSkip)
+    {
+        byte[] buffer = new byte[4096]; // Use a reasonable buffer size
+        while (bytesToSkip > 0)
+        {
+            int bytesToRead = Math.Min(buffer.Length, bytesToSkip);
+            int bytesRead = await stream.ReadAsync(buffer, 0, bytesToRead);
+            if (bytesRead == 0) throw new EndOfStreamException("Unexpected end of stream while skipping bytes");
+            bytesToSkip -= bytesRead;
+        }
+    }
 
     static byte[] ReadObject(string hash)
     {
