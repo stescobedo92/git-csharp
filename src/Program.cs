@@ -175,144 +175,152 @@ public class Program
             }
         }
         // --- Clone Command Implementation ---
-        else if (command == "clone")
+else if (command == "clone")
+{
+    if (args.Length < 3)
+    {
+        Console.WriteLine("Usage: clone <repository_url> <target_directory>");
+        return;
+    }
+
+    string repoUrl = args[1].TrimEnd('/'); // Ensure no trailing slash
+    string targetDir = args[2];
+
+    if (Directory.Exists(targetDir))
+    {
+        if (Directory.EnumerateFileSystemEntries(targetDir).Any())
         {
-            if (args.Length < 3)
+            Console.Error.WriteLine($"Error: Target directory '{targetDir}' exists and is not empty.");
+            return;
+        }
+    }
+    else
+    {
+        Directory.CreateDirectory(targetDir);
+    }
+
+    string originalDirectory = Directory.GetCurrentDirectory();
+    try
+    {
+        Directory.SetCurrentDirectory(targetDir);
+
+        Directory.CreateDirectory(".git");
+        Directory.CreateDirectory(".git/objects");
+        Directory.CreateDirectory(".git/refs");
+        Directory.CreateDirectory(".git/refs/heads");
+        File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n");
+
+        Console.WriteLine($"Cloning into '{Path.GetFileName(targetDir)}'...");
+
+        using (var client = new HttpClient())
+        {
+            client.DefaultRequestHeaders.UserAgent.ParseAdd("git/2.30.0"); // More standard Git user agent
+            client.DefaultRequestHeaders.Accept.ParseAdd("application/x-git-upload-pack-result");
+
+            // --- Step 1: Discover references ---
+            string infoRefsUrl = $"{repoUrl}/info/refs?service=git-upload-pack";
+            Console.WriteLine($"Fetching refs from {infoRefsUrl}");
+            HttpResponseMessage infoRefsResponse = await client.GetAsync(infoRefsUrl);
+
+            if (!infoRefsResponse.IsSuccessStatusCode)
             {
-                Console.WriteLine("Usage: clone <repository_url> <target_directory>");
+                Console.Error.WriteLine($"Failed to fetch refs: {infoRefsResponse.StatusCode}");
+                string errorContent = await infoRefsResponse.Content.ReadAsStringAsync();
+                Console.Error.WriteLine($"Server response: {errorContent}");
                 return;
             }
 
-            string repoUrl = args[1].TrimEnd('/'); // Ensure no trailing slash
-            string targetDir = args[2];
+            using var infoRefsStream = await infoRefsResponse.Content.ReadAsStreamAsync();
+            var refs = await ParseInfoRefs(infoRefsStream);
 
-            if (Directory.Exists(targetDir))
+            if (!refs.Any())
             {
-                if (Directory.EnumerateFileSystemEntries(targetDir).Any())
-                {
-                    Console.Error.WriteLine($"Error: Target directory '{targetDir}' exists and is not empty.");
-                    return;
-                }
-            }
-            else
-            {
-                Directory.CreateDirectory(targetDir);
+                Console.Error.WriteLine("No refs found.");
+                return;
             }
 
-            string originalDirectory = Directory.GetCurrentDirectory();
-            try
+            string? headCommit = null;
+            string? headRefName = null;
+            if (refs.TryGetValue("HEAD", out string headTargetRef) && refs.TryGetValue(headTargetRef, out string targetCommit))
             {
-                Directory.SetCurrentDirectory(targetDir);
-
-                Directory.CreateDirectory(".git");
-                Directory.CreateDirectory(".git/objects");
-                Directory.CreateDirectory(".git/refs");
-                Directory.CreateDirectory(".git/refs/heads");
-                File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n");
-
-                Console.WriteLine($"Cloning into '{Path.GetFileName(targetDir)}'...");
-
-                using (var client = new HttpClient())
-                {
-                    client.DefaultRequestHeaders.UserAgent.ParseAdd("csharp-git-client/1.0");
-                    client.DefaultRequestHeaders.Accept.ParseAdd("application/x-git-upload-pack-result");
-
-                    // --- Step 1: Discover references ---
-                    string infoRefsUrl = $"{repoUrl}/info/refs?service=git-upload-pack";
-                    Console.WriteLine($"Fetching refs from {infoRefsUrl}");
-                    HttpResponseMessage infoRefsResponse = await client.GetAsync(infoRefsUrl);
-
-                    if (!infoRefsResponse.IsSuccessStatusCode)
-                    {
-                        Console.Error.WriteLine($"Failed to fetch refs: {infoRefsResponse.StatusCode}");
-                        string errorContent = await infoRefsResponse.Content.ReadAsStringAsync();
-                        Console.Error.WriteLine($"Server response: {errorContent}");
-                        return;
-                    }
-
-                    using var infoRefsStream = await infoRefsResponse.Content.ReadAsStreamAsync();
-                    var refs = await ParseInfoRefs(infoRefsStream);
-
-                    if (!refs.Any())
-                    {
-                        Console.Error.WriteLine("No refs found.");
-                        return;
-                    }
-
-                    string? headCommit = null;
-                    string? headRefName = null;
-                    if (refs.TryGetValue("HEAD", out string headTargetRef) && refs.TryGetValue(headTargetRef, out string targetCommit))
-                    {
-                        headCommit = targetCommit;
-                        headRefName = headTargetRef;
-                    }
-                    else if (refs.TryGetValue("refs/heads/main", out string mainCommit))
-                    {
-                        headCommit = mainCommit;
-                        headRefName = "refs/heads/main";
-                    }
-                    else if (refs.TryGetValue("refs/heads/master", out string masterCommit))
-                    {
-                        headCommit = masterCommit;
-                        headRefName = "refs/heads/master";
-                    }
-
-                    if (string.IsNullOrEmpty(headCommit) || string.IsNullOrEmpty(headRefName))
-                    {
-                        Console.Error.WriteLine("Could not determine HEAD commit or ref name from available refs:");
-                        foreach (var kvp in refs) Console.WriteLine($"- {kvp.Value} {kvp.Key}");
-                        return;
-                    }
-
-                    Console.WriteLine($"Determined HEAD commit: {headCommit} ({headRefName})");
-
-                    // Null-forgiving operator used here to silence the compiler's null warning
-                    File.WriteAllText(".git/HEAD", $"ref: {headRefName!}\n");
-
-                    // --- Step 2: Negotiate and fetch packfile ---
-                    string uploadPackUrl = $"{repoUrl}/git-upload-pack";
-                    Console.WriteLine($"Requesting packfile from {uploadPackUrl}");
-
-                    // Minimal "want" request
-                    string minimalWantLine = $"want {headCommit}\n";
-                    string requestBody = $"{(minimalWantLine.Length + 4):x4}{minimalWantLine}00000009done\n";
-                    Console.WriteLine($"DEBUG: Sending request body (pkt-line):\n{requestBody.Replace("\n", "\\n\n")}"); // Debug output
-
-                    var content = new StringContent(requestBody, Encoding.UTF8, "application/x-git-upload-pack-request");
-                    HttpResponseMessage packResponse = await client.PostAsync(uploadPackUrl, content);
-
-                    if (!packResponse.IsSuccessStatusCode)
-                    {
-                        Console.Error.WriteLine($"Failed to fetch pack: {packResponse.StatusCode}"); 
-                        string errorContent = await packResponse.Content.ReadAsStringAsync();
-                        Console.Error.WriteLine($"Server response: {errorContent}");
-                        return;
-                    }
-
-                    // --- Step 3: Process packfile ---
-                    Console.WriteLine("Receiving packfile...");
-                    using var packStream = await packResponse.Content.ReadAsStreamAsync();
-                    await ProcessPackfile(packStream); // Process the stream
-
-                    // --- Step 4: Checkout HEAD ---
-                    Console.WriteLine($"Checking out commit {headCommit}");
-                    CheckoutHead(headCommit);
-
-                    Console.WriteLine($"Successfully cloned repository to {targetDir}");
-                }
+                headCommit = targetCommit;
+                headRefName = headTargetRef;
             }
-            catch (Exception ex)
+            else if (refs.TryGetValue("refs/heads/main", out string mainCommit))
             {
-                Console.Error.WriteLine($"An error occurred during clone: {ex.Message}");
-                Console.Error.WriteLine(ex.StackTrace);
+                headCommit = mainCommit;
+                headRefName = "refs/heads/main";
             }
-            finally
+            else if (refs.TryGetValue("refs/heads/master", out string masterCommit))
             {
-                Directory.SetCurrentDirectory(originalDirectory);
-                _packObjectsByOffset.Clear();
-                _packObjectsByHash.Clear();
+                headCommit = masterCommit;
+                headRefName = "refs/heads/master";
             }
+
+            if (string.IsNullOrEmpty(headCommit) || string.IsNullOrEmpty(headRefName))
+            {
+                Console.Error.WriteLine("Could not determine HEAD commit or ref name from available refs:");
+                foreach (var kvp in refs) Console.WriteLine($"- {kvp.Value} {kvp.Key}");
+                return;
+            }
+
+            Console.WriteLine($"Determined HEAD commit: {headCommit} ({headRefName})");
+
+            // Null-forgiving operator used here to silence the compiler's null warning
+            File.WriteAllText(".git/HEAD", $"ref: {headRefName!}\n");
+
+            // --- Step 2: Negotiate and fetch packfile ---
+            string uploadPackUrl = $"{repoUrl}/git-upload-pack";
+            Console.WriteLine($"Requesting packfile from {uploadPackUrl}");
+
+            // Fix: Create proper git protocol request
+            // Format the packet line with the correct length prefix (4 hex digits)
+            string wantLine = $"want {headCommit}\n";
+            StringBuilder sb = new StringBuilder();
+            // Send the length as 4-digit hex including the 4 bytes of the length itself
+            sb.Append($"{wantLine.Length + 4:x4}{wantLine}");
+            // Add a flush packet and "done" command
+            sb.Append("0000");
+            sb.Append($"0009done\n");
+            
+            string requestBody = sb.ToString();
+            Console.WriteLine($"DEBUG: Sending request body (pkt-line):{requestBody.Replace("\n", "\\n")}"); // Debug output
+
+            var content = new StringContent(requestBody, Encoding.UTF8, "application/x-git-upload-pack-request");
+            HttpResponseMessage packResponse = await client.PostAsync(uploadPackUrl, content);
+
+            if (!packResponse.IsSuccessStatusCode)
+            {
+                Console.Error.WriteLine($"Failed to fetch pack: {packResponse.StatusCode}"); 
+                string errorContent = await packResponse.Content.ReadAsStringAsync();
+                Console.Error.WriteLine($"Server response: {errorContent}");
+                return;
+            }
+
+            // --- Step 3: Process packfile ---
+            Console.WriteLine("Receiving packfile...");
+            using var packStream = await packResponse.Content.ReadAsStreamAsync();
+            await ProcessPackfile(packStream); // Process the stream
+
+            // --- Step 4: Checkout HEAD ---
+            Console.WriteLine($"Checking out commit {headCommit}");
+            CheckoutHead(headCommit);
+
+            Console.WriteLine($"Successfully cloned repository to {targetDir}");
         }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"An error occurred during clone: {ex.Message}");
+        Console.Error.WriteLine(ex.StackTrace);
+    }
+    finally
+    {
+        Directory.SetCurrentDirectory(originalDirectory);
+        _packObjectsByOffset.Clear();
+        _packObjectsByHash.Clear();
+    }
+}
         else
         {
             Console.Error.WriteLine($"Unknown command {command}");
