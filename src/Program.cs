@@ -19,6 +19,10 @@ public record TreeEntry(string Mode, string FileName, byte[] Hash);
 // BaseOffset: Stores the *relative* negative offset for ofs_delta.
 public record PackObject(string Type, byte[] Data, long Offset, long BaseOffset = -1, string? BaseHash = null);
 
+// Represents the result of parsing the info/refs response
+public record InfoRefsResult(Dictionary<string, string> Refs, List<string> Capabilities, string? HeadRefTarget);
+
+
 public class Program
 {
     // Stores PackObject records as read initially from the packfile, keyed by their absolute starting offset.
@@ -26,6 +30,9 @@ public class Program
     // Stores fully resolved PackObjects (base types only), keyed by their SHA-1 hash.
     // Also used as a cache during delta resolution.
     private static Dictionary<string, PackObject> _packObjectsByHash = new();
+
+    // Define a user agent string
+    private const string UserAgent = "git/git-csharp-client-0.2";
 
     public static async Task Main(string[] args)
     {
@@ -87,6 +94,7 @@ public class Program
             Console.Error.WriteLine($"An unexpected error occurred: {ex.Message}");
             Console.Error.WriteLine(ex.StackTrace);
             // Optionally set an exit code here
+            Environment.ExitCode = 1; // Indicate failure
         }
     }
 
@@ -114,8 +122,9 @@ public class Program
                 return;
             }
             // Extract content after the null byte
-            string content = Encoding.UTF8.GetString(data, nullByteIndex + 1, data.Length - (nullByteIndex + 1));
-            Console.Write(content);
+            // Use stdout for content, stderr for errors
+            using var stdout = Console.OpenStandardOutput();
+            stdout.Write(data, nullByteIndex + 1, data.Length - (nullByteIndex + 1));
         }
         catch (FileNotFoundException)
         {
@@ -202,9 +211,13 @@ public class Program
             else // Handle empty directory case
             {
                 // Standard hash for an empty tree
-                Console.Write("4b825dc642cb6eb9a060e54bf8d69288fbee4904");
-                // Optionally, write the empty tree object if it doesn't exist
-                GenerateAndWriteHash("tree", Array.Empty<byte>());
+                const string emptyTreeHash = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+                Console.Write(emptyTreeHash);
+                // Write the empty tree object if it doesn't exist
+                if (!ObjectExists(emptyTreeHash))
+                {
+                    GenerateAndWriteHash("tree", Array.Empty<byte>());
+                }
             }
         }
         catch (Exception ex)
@@ -225,9 +238,15 @@ public class Program
                  return;
             }
 
-            // TODO: Get author/committer info from config or environment variables
-            string author = "Author Name <author@example.com>";
-            string committer = "Committer Name <committer@example.com>";
+            // TODO: Get author/committer info from config or environment variables more robustly
+            string authorName = Environment.GetEnvironmentVariable("GIT_AUTHOR_NAME") ?? "Author Name";
+            string authorEmail = Environment.GetEnvironmentVariable("GIT_AUTHOR_EMAIL") ?? "author@example.com";
+            string committerName = Environment.GetEnvironmentVariable("GIT_COMMITTER_NAME") ?? "Committer Name";
+            string committerEmail = Environment.GetEnvironmentVariable("GIT_COMMITTER_EMAIL") ?? "committer@example.com";
+
+            string author = $"{authorName} <{authorEmail}>";
+            string committer = $"{committerName} <{committerEmail}>";
+
             long unixTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             TimeSpan offset = TimeZoneInfo.Local.GetUtcOffset(DateTimeOffset.UtcNow);
             string timezone = $"{(offset < TimeSpan.Zero ? "-" : "+")}{offset:hhmm}";
@@ -282,39 +301,43 @@ public class Program
             using (var client = new HttpClient())
             {
                 // Standard Git User-Agent helps with some servers
-                client.DefaultRequestHeaders.UserAgent.ParseAdd("git/git-csharp-client-0.1");
+                client.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
                 client.DefaultRequestHeaders.Accept.ParseAdd("application/x-git-upload-pack-result");
 
-                // 1. Fetch refs
+                // 1. Fetch refs and capabilities
                 string infoRefsUrl = $"{repoUrl}/info/refs?service=git-upload-pack";
                 Console.WriteLine($"Fetching refs from {infoRefsUrl}");
                 HttpResponseMessage infoRefsResponse = await client.GetAsync(infoRefsUrl);
 
                 if (!infoRefsResponse.IsSuccessStatusCode)
                 {
-                    Console.Error.WriteLine($"Failed to fetch refs: {infoRefsResponse.StatusCode}");
+                    // Throw exception on failure to fetch refs
                     string errorContent = await infoRefsResponse.Content.ReadAsStringAsync();
-                    Console.Error.WriteLine($"Server response: {errorContent}");
-                    return;
+                    throw new HttpRequestException($"Failed to fetch refs: {infoRefsResponse.StatusCode}. Server response: {errorContent}");
                 }
 
                 using var infoRefsStream = await infoRefsResponse.Content.ReadAsStreamAsync();
-                var refs = await ParseInfoRefs(infoRefsStream);
+                var infoRefsResult = await ParseInfoRefs(infoRefsStream);
+                var refs = infoRefsResult.Refs;
+                var capabilities = infoRefsResult.Capabilities;
 
                 if (!refs.Any())
                 {
-                    Console.Error.WriteLine("No refs found on remote repository.");
-                    return; // Or handle empty repo case
+                    Console.Error.WriteLine("No refs found on remote repository. Cloning an empty repository?");
+                    // Handle empty repo case - create initial structure but don't fetch pack/checkout
+                     File.WriteAllText(".git/HEAD", "ref: refs/heads/main\n"); // Or master
+                     Console.WriteLine($"Initialized empty repository in {targetDir}");
+                    return;
                 }
 
                 // 2. Determine HEAD commit
                 string? headCommit = null;
                 string? headRefName = null;
-                // Prefer finding HEAD via symref
-                if (refs.TryGetValue("HEAD", out string headTargetRef) && refs.TryGetValue(headTargetRef, out string targetCommit))
+                // Prefer finding HEAD via symref from infoRefsResult
+                if (infoRefsResult.HeadRefTarget != null && refs.TryGetValue(infoRefsResult.HeadRefTarget, out string targetCommit))
                 {
                     headCommit = targetCommit;
-                    headRefName = headTargetRef;
+                    headRefName = infoRefsResult.HeadRefTarget;
                 }
                 else // Fallback to common branch names
                 {
@@ -330,45 +353,46 @@ public class Program
 
                 if (string.IsNullOrEmpty(headCommit) || string.IsNullOrEmpty(headRefName))
                 {
-                    Console.Error.WriteLine("Could not determine HEAD commit or ref name from available refs:");
-                    foreach (var kvp in refs) Console.WriteLine($"- {kvp.Value} {kvp.Key}");
-                    return;
+                    // Log available refs for debugging before throwing
+                    Console.Error.WriteLine("Available refs:");
+                    foreach (var kvp in refs) Console.Error.WriteLine($"- {kvp.Value} {kvp.Key}");
+                    throw new InvalidOperationException("Could not determine HEAD commit or ref name from available refs.");
                 }
 
                 Console.WriteLine($"Determined HEAD commit: {headCommit} ({headRefName})");
                 // Update local HEAD to point to the determined remote HEAD ref
                 File.WriteAllText(".git/HEAD", $"ref: {headRefName}\n");
-                // Optionally, write the ref file itself immediately (e.g., .git/refs/heads/main)
-                // string headRefPath = Path.Combine(".git", headRefName);
-                // Directory.CreateDirectory(Path.GetDirectoryName(headRefPath)!);
-                // File.WriteAllText(headRefPath, headCommit + "\n");
-                // Note: CheckoutHead will also update this ref file later.
 
-                // 3. Request packfile for the HEAD commit
+                // 3. Request packfile for the HEAD commit, including capabilities
                 string uploadPackUrl = $"{repoUrl}/git-upload-pack";
                 Console.WriteLine($"Requesting packfile from {uploadPackUrl}");
 
-                // Construct pkt-line request body
+                // Construct pkt-line request body with capabilities
                 StringBuilder sb = new StringBuilder();
-                string wantLine = $"want {headCommit}\n";
-                // Format: "XXXXwant <hash>\n" where XXXX is hex length
+                // Build capabilities string (include agent, side-band-64k if supported)
+                var requestCapabilities = new List<string> { $"agent={UserAgent}" };
+                if (capabilities.Contains("side-band-64k")) requestCapabilities.Add("side-band-64k");
+                // Add other desired capabilities like multi_ack, thin-pack etc. if implementing them
+
+                string capsString = string.Join(" ", requestCapabilities);
+                string wantLine = $"want {headCommit} {capsString}\n"; // Add caps to first want
+                // Format: "XXXXwant <hash> <caps>\n" where XXXX is hex length
                 sb.Append($"{wantLine.Length + 4:x4}{wantLine}");
-                // Add capabilities if needed (e.g., multi_ack, side-band-64k) - omitted for simplicity
-                sb.Append("0000"); // Flush packet
+                // Add subsequent 'want' lines if needed (for multiple branches/tags) - omitted
+                sb.Append("0000"); // Flush packet signifies end of wants
                 sb.Append("0009done\n"); // Done command
 
                 string requestBody = sb.ToString();
-                // Console.WriteLine($"DEBUG: Sending request body (pkt-line):{requestBody.Replace("\n", "\\n")}"); // Keep for debugging if needed
+                Console.WriteLine($"DEBUG: Sending request body (pkt-line):{requestBody.Replace("\n", "\\n")}"); // Keep for debugging
 
                 var content = new StringContent(requestBody, Encoding.UTF8, "application/x-git-upload-pack-request");
                 HttpResponseMessage packResponse = await client.PostAsync(uploadPackUrl, content);
 
                 if (!packResponse.IsSuccessStatusCode)
                 {
-                    Console.Error.WriteLine($"Failed to fetch pack: {packResponse.StatusCode}");
+                    // Throw exception on failure to fetch pack
                     string errorContent = await packResponse.Content.ReadAsStringAsync();
-                    Console.Error.WriteLine($"Server response: {errorContent}");
-                    return;
+                    throw new HttpRequestException($"Failed to fetch pack: {packResponse.StatusCode}. Server response: {errorContent}");
                 }
 
                 Console.WriteLine("Receiving packfile...");
@@ -376,9 +400,15 @@ public class Program
 
                 // 4. Process the packfile response
                 // Skip initial pkt-line headers/messages before the "PACK" signature
-                await SkipPackResponseHeaders(packStream);
+                // This now handles non-seekable streams
+                bool packHeaderRead = await SkipPackResponseHeaders(packStream);
+                if (!packHeaderRead)
+                {
+                    throw new InvalidDataException("PACK header not found in response stream.");
+                }
+
                 // Process the actual pack data
-                await ProcessPackfile(packStream);
+                await ProcessPackfile(packStream, packHeaderRead);
 
                 // 5. Checkout the downloaded HEAD commit
                 Console.WriteLine($"Checking out commit {headCommit}");
@@ -387,9 +417,20 @@ public class Program
                 Console.WriteLine($"Successfully cloned repository to {targetDir}");
             }
         }
-        catch (Exception ex)
+        // Catch specific exceptions for better error handling
+        catch (HttpRequestException httpEx)
         {
-            Console.Error.WriteLine($"An error occurred during clone: {ex.Message}");
+             Console.Error.WriteLine($"Network error during clone: {httpEx.Message}");
+             // No stack trace needed for typical network errors
+        }
+        catch (InvalidOperationException opEx)
+        {
+             Console.Error.WriteLine($"Operation error during clone: {opEx.Message}");
+             Console.Error.WriteLine(opEx.StackTrace);
+        }
+        catch (Exception ex) // Catch-all for unexpected errors
+        {
+            Console.Error.WriteLine($"An unexpected error occurred during clone: {ex.Message}");
             Console.Error.WriteLine(ex.StackTrace);
             // Consider cleaning up the partially cloned directory
         }
@@ -447,14 +488,20 @@ public class Program
         var hashBytes = SHA1.HashData(gitObject);
         var hashString = Convert.ToHexString(hashBytes).ToLower();
 
-        // Write the compressed object to disk
-        WriteObjectToDiskInternal(hashString, gitObject);
+        // Write the compressed object to disk only if it doesn't exist
+        // This avoids unnecessary writes and potential race conditions (though less likely here)
+        string objectPath = Path.Combine(".git", "objects", hashString.Substring(0, 2), hashString.Substring(2));
+        if (!File.Exists(objectPath))
+        {
+            WriteObjectToDiskInternal(hashString, gitObject, objectPath);
+        }
+
 
         return hashString;
     }
 
-    // Internal helper to compress and write object bytes using a pre-calculated hash
-    static void WriteObjectToDiskInternal(string hashString, byte[] rawGitObjectBytes)
+    // Internal helper to compress and write object bytes using a pre-calculated hash and path
+    static void WriteObjectToDiskInternal(string hashString, byte[] rawGitObjectBytes, string objectPath)
     {
          using var memoryStream = new MemoryStream();
          // Compress the raw object data (header + content)
@@ -464,10 +511,20 @@ public class Program
          } // zlibStream is disposed here, flushing the data to memoryStream
          var compressedObject = memoryStream.ToArray();
 
-         // Determine path and write to file
-         var objectDir = Path.Combine(".git", "objects", hashString.Substring(0, 2));
-         var objectPath = Path.Combine(objectDir, hashString.Substring(2));
-         Directory.CreateDirectory(objectDir); // Ensure the subdirectory exists
+         // Ensure the subdirectory exists
+         var objectDir = Path.GetDirectoryName(objectPath);
+         if (objectDir != null) // Check if GetDirectoryName returned null (shouldn't happen here)
+         {
+            Directory.CreateDirectory(objectDir);
+         }
+         else
+         {
+             // Handle unexpected error getting directory path
+             Console.Error.WriteLine($"Warning: Could not determine directory for object {hashString}");
+             return; // Or throw?
+         }
+
+         // Write to file
          File.WriteAllBytes(objectPath, compressedObject);
     }
 
@@ -487,6 +544,8 @@ public class Program
     // Checks if a loose object exists
     static bool ObjectExists(string hash)
     {
+        // Basic validation for hash format
+        if (string.IsNullOrEmpty(hash) || hash.Length != 40) return false;
         string path = Path.Combine(".git", "objects", hash.Substring(0, 2), hash.Substring(2));
         return File.Exists(path);
     }
@@ -513,7 +572,8 @@ public class Program
             int nullByteIndex = Array.IndexOf(rawData, (byte)0);
             if (nullByteIndex == -1) throw new InvalidDataException($"Invalid object format on disk for {hash}");
             // Return only the content part after the null byte
-            return rawData.Skip(nullByteIndex + 1).ToArray();
+            // Use slicing for potentially better performance than Skip().ToArray()
+            return rawData[(nullByteIndex + 1)..];
         }
 
         // If not found, the object is missing
@@ -571,6 +631,7 @@ public class Program
 
             // Recursively generate hash for the subdirectory
             var directoryHashString = GenerateTreeObjectHash(directory);
+            // *** FIX for CS8604: Check if directoryHashString is null before using it ***
             if (directoryHashString != null)
             {
                 var directoryHashBytes = Convert.FromHexString(directoryHashString);
@@ -631,37 +692,38 @@ public class Program
 
     // --- Packfile Handling ---
 
-    // Skips pkt-line headers until "PACK" or end of headers
-    static async Task SkipPackResponseHeaders(Stream stream)
+    // Skips pkt-line headers until "PACK" or end of headers.
+    // Returns true if the "PACK" header was found and the stream is positioned after it.
+    // Returns false if the stream ended before finding "PACK".
+    static async Task<bool> SkipPackResponseHeaders(Stream stream)
     {
+        byte[] buffer = new byte[4096]; // Buffer for reading lines/skipping
         byte[] lengthBuffer = new byte[4];
+
         while (true)
         {
+            // Read the 4-byte length header
             int totalRead = 0;
             while (totalRead < 4)
             {
                 int read = await stream.ReadAsync(lengthBuffer, totalRead, 4 - totalRead);
-                if (read == 0) throw new EndOfStreamException("Unexpected end of stream while reading pkt-line header before PACK data");
+                if (read == 0)
+                {
+                    // End of stream before finding PACK or finishing a line
+                    if (totalRead == 0) return false; // Clean end of stream
+                    throw new EndOfStreamException("Unexpected end of stream while reading pkt-line header before PACK data");
+                }
                 totalRead += read;
             }
 
             string lengthHex = Encoding.ASCII.GetString(lengthBuffer);
 
-            // Check for PACK signature (special case, not a standard pkt-line)
+            // Check for PACK signature
             if (lengthHex == "PACK")
             {
-                // Found PACK, need to rewind the stream 4 bytes so ProcessPackfile can read it
-                if (stream.CanSeek)
-                {
-                    stream.Seek(-4, SeekOrigin.Current);
-                }
-                else
-                {
-                    // This is problematic for non-seekable streams (like network streams)
-                    // A potential workaround is to read the PACK header here and pass it to ProcessPackfile
-                    throw new NotSupportedException("Stream must be seekable to process packfile response after skipping headers.");
-                }
-                return; // Exit the loop, ready for ProcessPackfile
+                // Found PACK. The stream is now positioned *after* "PACK".
+                // ProcessPackfile needs to know this.
+                return true;
             }
 
             // Parse the hex length
@@ -670,37 +732,31 @@ public class Program
                 throw new InvalidDataException($"Invalid pkt-line length hex: {lengthHex}");
             }
 
-            // 0000 is the flush packet, often indicating end of headers/messages section
-            // However, sideband data might follow, so we continue until PACK is found.
-            // If length is 4, it's an empty line (e.g., "0004"), just skip it.
             if (length == 0) // Flush packet "0000"
             {
                  // Continue searching for PACK, could be messages after flush
                  continue;
             }
-             if (length < 4) // Invalid length
+            if (length < 4) // Invalid length
             {
                  throw new InvalidDataException($"Invalid pkt-line length value: {length}");
             }
-
 
             // Read and discard the line content (length includes the 4 bytes we read)
             int bytesToSkip = length - 4;
             if (bytesToSkip > 0)
             {
-                await SkipBytes(stream, bytesToSkip);
+                await SkipBytes(stream, bytesToSkip, buffer); // Use buffer for skipping
             }
              // If length was 4, we skip 0 bytes, effectively just consuming the header.
         }
     }
 
-    // Helper to skip a specific number of bytes from a stream
-    static async Task SkipBytes(Stream stream, int bytesToSkip)
+    // Helper to skip a specific number of bytes from a stream, using a provided buffer
+    static async Task SkipBytes(Stream stream, int bytesToSkip, byte[] buffer)
     {
         if (bytesToSkip <= 0) return;
 
-        // Use a buffer for potentially large skips
-        byte[] buffer = new byte[Math.Min(4096, bytesToSkip)];
         while (bytesToSkip > 0)
         {
             int bytesToRead = Math.Min(buffer.Length, bytesToSkip);
@@ -745,89 +801,88 @@ public class Program
         }
 
         // Trim trailing newline if present
-        if (dataBytes.LastOrDefault() == '\n')
+        if (dataBytes.Length > 0 && dataBytes[^1] == '\n') // Use index from end operator
             return Encoding.UTF8.GetString(dataBytes, 0, dataBytes.Length - 1);
         else
             return Encoding.UTF8.GetString(dataBytes);
     }
 
-    // Parses the response from /info/refs
-    static async Task<Dictionary<string, string>> ParseInfoRefs(Stream stream)
+    // Parses the response from /info/refs, extracting refs, capabilities, and HEAD target
+    static async Task<InfoRefsResult> ParseInfoRefs(Stream stream)
     {
         var refs = new Dictionary<string, string>();
-        string? headSymRefTarget = null; // Store the target of the symbolic ref HEAD
+        var capabilities = new List<string>();
+        string? headSymRefTarget = null;
+        bool firstLineProcessed = false;
 
-        // First line usually contains service info and capabilities
-        string firstLine = await ReadPktLine(stream);
-        if (!firstLine.StartsWith("# service=git-upload-pack"))
-        {
-            // This might not be fatal, but log a warning
-            Console.Error.WriteLine($"Warning: Expected '# service=git-upload-pack', got '{firstLine}'");
-        }
-        // The first line might also contain capabilities and the first ref after a null byte.
-        // A robust parser would handle this. This simple one assumes refs start after.
-
-        // Read the first ref line (often separated by a null byte in the first line,
-        // handled here by assuming ReadPktLine reads past it or it's on a new line).
-        // A simple approach is to just read the next line, assuming the first line was just header.
-        string firstRefLine = await ReadPktLine(stream);
-        if (firstRefLine == "0000") return refs; // Empty repo?
-
-        // Process the first ref line manually before the loop
-        ParseRefLine(firstRefLine, refs, ref headSymRefTarget);
-
-
-        // Process remaining ref lines
         while (true)
         {
             string line = await ReadPktLine(stream);
             if (line == "0000") break; // End of refs marker
-             if (string.IsNullOrEmpty(line)) continue; // Skip empty lines if any
+            if (string.IsNullOrEmpty(line)) continue; // Skip empty lines
 
-            ParseRefLine(line, refs, ref headSymRefTarget);
+            // The very first line contains service name and capabilities before the first ref
+            if (!firstLineProcessed)
+            {
+                firstLineProcessed = true;
+                if (line.StartsWith("# service=git-upload-pack"))
+                {
+                    // Skip the service part
+                    line = await ReadPktLine(stream); // Read the actual first ref line
+                    if (line == "0000") break;
+                    if (string.IsNullOrEmpty(line)) continue;
+                }
+                // Else: Assume the first line read *is* the first ref line potentially with capabilities
+
+                // Parse capabilities from the *first* ref line
+                int nullIndex = line.IndexOf('\0');
+                if (nullIndex != -1)
+                {
+                    string capsPart = line.Substring(nullIndex + 1);
+                    capabilities.AddRange(capsPart.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+                    // Extract symref=HEAD from capabilities here
+                    headSymRefTarget = capabilities
+                        .FirstOrDefault(c => c.StartsWith("symref=HEAD:"))
+                        ?.Substring("symref=HEAD:".Length);
+
+                    // Trim the line to just the ref part for parsing below
+                    line = line.Substring(0, nullIndex);
+                }
+            }
+
+            // Parse the ref part (hash and name)
+            ParseRefLine(line, refs);
         }
 
-        // Resolve symbolic HEAD if possible
+        // Resolve symbolic HEAD if possible *after* parsing all refs
         if (headSymRefTarget != null && refs.TryGetValue(headSymRefTarget, out string targetHash))
         {
-            refs["HEAD"] = targetHash; // Add resolved HEAD hash
+            // Add/update HEAD entry to point to the resolved commit hash
+            refs["HEAD"] = targetHash;
         }
         else if (headSymRefTarget != null)
         {
              Console.Error.WriteLine($"Warning: HEAD is symref to '{headSymRefTarget}' but target ref was not found.");
+             // Potentially remove the HEAD entry if it points to a non-existent ref? Or leave it?
+             // Leaving it might be okay, but resolution failed.
         }
         else if (!refs.ContainsKey("HEAD")) // If HEAD wasn't a symref and wasn't listed directly
         {
             Console.Error.WriteLine("Warning: Could not resolve HEAD commit hash from info/refs.");
         }
 
-
-        return refs;
+        return new InfoRefsResult(refs, capabilities, headSymRefTarget);
     }
 
-    // Helper to parse a single line from info/refs output
-    static void ParseRefLine(string line, Dictionary<string, string> refs, ref string? headSymRefTarget)
+    // Helper to parse a single ref line (hash and name) - capabilities handled separately
+    static void ParseRefLine(string refLine, Dictionary<string, string> refs)
     {
-         string[] parts = line.Split(' ', 2); // Split into hash and rest
+         // Line should be "hash refname" at this point
+         string[] parts = refLine.Split(' ', 2); // Split into hash and refname
          if (parts.Length < 2) return; // Invalid line format
 
          string hash = parts[0];
-         string namePart = parts[1];
-
-         // Check for capabilities attached to the ref name (separated by null byte)
-         string refName;
-         string[] capabilities = Array.Empty<string>();
-         int nullIndex = namePart.IndexOf('\0');
-         if (nullIndex != -1)
-         {
-             refName = namePart.Substring(0, nullIndex);
-             capabilities = namePart.Substring(nullIndex + 1).Split(' ');
-         }
-         else
-         {
-             refName = namePart;
-         }
-
+         string refName = parts[1];
 
          // Store the ref
          if (refName.EndsWith("^{}"))
@@ -839,44 +894,38 @@ public class Program
              {
                  refs[baseTagName] = hash;
              }
+             // Also store the peeled ref itself? Git clients might use it.
+             // refs[refName] = hash; // Optional: Store the "tag^{}" ref too
          }
          else
          {
+             // Store regular refs (branches, tags, HEAD if direct)
              refs[refName] = hash;
-         }
-
-         // Check capabilities for symref=HEAD:target
-         foreach (string capability in capabilities)
-         {
-             if (capability.StartsWith("symref=HEAD:"))
-             {
-                 headSymRefTarget = capability.Substring("symref=HEAD:".Length);
-             }
-         }
-         // Also check if the refName *is* HEAD (for non-symref HEAD)
-         if(refName == "HEAD" && headSymRefTarget == null) // If HEAD is listed directly
-         {
-             refs["HEAD"] = hash;
          }
     }
 
 
     // Processes the packfile stream, reading objects and storing them
-    static async Task ProcessPackfile(Stream packStream)
+    // packHeaderAlreadyRead indicates if the "PACK" signature was consumed by SkipPackResponseHeaders
+    static async Task ProcessPackfile(Stream packStream, bool packHeaderAlreadyRead)
     {
         // Clear caches before processing
         _packObjectsByOffset.Clear();
         _packObjectsByHash.Clear();
         List<PackObject> readObjects = new(); // Temporarily store objects as read
 
-        // Use BinaryReader directly on the network stream (removed BufferedStream)
+        // Use BinaryReader directly on the network stream
         // Ensure ASCII encoding for headers and keep stream open
         using var reader = new BinaryReader(packStream, Encoding.ASCII, true);
 
-        // 1. Read Packfile Header
-        byte[] signature = reader.ReadBytes(4);
-        if (Encoding.ASCII.GetString(signature) != "PACK")
-            throw new InvalidDataException("Invalid packfile signature.");
+        // 1. Read Packfile Header (if not already read)
+        if (!packHeaderAlreadyRead)
+        {
+             byte[] signature = reader.ReadBytes(4);
+             if (Encoding.ASCII.GetString(signature) != "PACK")
+                 throw new InvalidDataException("Invalid packfile signature.");
+        }
+        // else: SkipPackResponseHeaders already consumed "PACK"
 
         uint version = ReadNetworkUInt32(reader);
         if (version != 2)
@@ -885,39 +934,38 @@ public class Program
         uint objectCount = ReadNetworkUInt32(reader);
         Console.WriteLine($"Packfile contains {objectCount} objects.");
 
+        // Track current position accurately
+        long currentStreamPosition = reader.BaseStream.Position; // Position *after* header
+
         // 2. Read all object headers and data sequentially
         for (uint i = 0; i < objectCount; i++)
         {
-            long currentOffset = -1;
+            long objectStartOffset = currentStreamPosition; // Offset where this object *starts*
              try
              {
-                 // Get the offset *before* reading any data for this object
-                 // Note: BaseStream might not be accurately seekable/report position on network stream
-                 // This relies on BinaryReader tracking position correctly.
-                 currentOffset = reader.BaseStream.Position;
-
-                 var packObject = await ReadPackObjectFromReader(reader, currentOffset);
+                 var packObject = await ReadPackObjectFromReader(reader, objectStartOffset);
                  if (packObject != null)
                  {
                      readObjects.Add(packObject);
+                     // Update current position *after* successfully reading an object
+                     currentStreamPosition = reader.BaseStream.Position;
                  }
                  else
                  {
                      // If ReadPackObject returns null, it means decompression failed.
-                     Console.Error.WriteLine($"Warning: Failed to read or decompress object #{i + 1} at offset ~{currentOffset}. Skipping rest of packfile.");
-                     // Depending on error, might try to skip or abort. Aborting is safer.
-                     break;
+                     Console.Error.WriteLine($"Warning: Failed to read or decompress object #{i + 1} at offset ~{objectStartOffset}. Skipping rest of packfile.");
+                     break; // Aborting is safer.
                  }
              }
              catch (EndOfStreamException ex)
              {
-                 Console.Error.WriteLine($"Error reading object #{i + 1} at offset ~{currentOffset}: Unexpected end of stream. {ex.Message}");
-                 // This often means the previous object's decompression read too far.
+                 Console.Error.WriteLine($"Error reading object #{i + 1} at offset ~{objectStartOffset}: Unexpected end of stream. {ex.Message}");
+                 // This often means the previous object's decompression read too far or packfile is truncated.
                  break; // Stop processing the packfile
              }
              catch (Exception ex)
              {
-                 Console.Error.WriteLine($"Error reading object #{i + 1} at offset ~{currentOffset}: {ex.Message}\n{ex.StackTrace}");
+                 Console.Error.WriteLine($"Error reading object #{i + 1} at offset ~{objectStartOffset}: {ex.Message}\n{ex.StackTrace}");
                  break; // Stop processing on other errors too
              }
         }
@@ -950,14 +998,28 @@ public class Program
 
                 Console.Error.WriteLine($"Error storing object {objIdentifier}: {ex.Message}");
                 // Optionally print stack trace for debugging: Console.Error.WriteLine(ex.StackTrace);
-                // Decide whether to continue or abort; continuing might leave repo inconsistent.
+                // Decide whether to continue or abort; continuing might leave repo inconsistent. Aborting is safer.
+                throw; // Re-throw to stop the clone process on error
             }
         }
         Console.WriteLine($"Finished processing packfile. Stored {storedCount} objects.");
 
-        // 5. Verify Packfile Checksum (Optional but recommended)
-        // byte[] expectedChecksum = reader.ReadBytes(20);
-        // TODO: Calculate checksum of the received pack data and compare
+        // 5. Verify Packfile Checksum
+        try
+        {
+            byte[] expectedChecksum = reader.ReadBytes(20);
+            // TODO: Calculate checksum of the received pack data (excluding checksum itself) and compare
+            // This requires storing or re-reading the pack data. For now, just read it.
+            Console.WriteLine("Read expected packfile checksum.");
+        }
+        catch (EndOfStreamException)
+        {
+             Console.Error.WriteLine("Warning: Could not read packfile checksum (end of stream).");
+        }
+        catch (Exception ex)
+        {
+             Console.Error.WriteLine($"Warning: Error reading packfile checksum: {ex.Message}");
+        }
     }
 
 
@@ -1015,29 +1077,35 @@ public class Program
             // Important: ZLibStream reads until it finds the zlib stream end marker.
             // It does NOT know the expected *uncompressed* size beforehand.
             // If it reads past the end of this object's data into the next object,
-            // it will corrupt the main stream position.
+            // it will corrupt the main stream position. This is a common source of errors.
+            // We rely on the server sending correctly formed zlib streams.
             using (var zlibStream = new ZLibStream(reader.BaseStream, CompressionMode.Decompress, true)) // leaveOpen = true
             {
                 // CopyToAsync reads until the end of the zlib stream is detected.
                 await zlibStream.CopyToAsync(decompressedStream);
             }
         }
-        catch (Exception ex) // Catch specific exceptions like InvalidDataException if needed
+        catch (InvalidDataException zlibEx) // Catch specific ZLib errors
         {
-            Console.Error.WriteLine($"Error during ZLib decompression for object type {type} at offset {actualObjectOffset}: {ex.Message}");
-            // Return null to indicate failure to read this object
-            return null;
+             Console.Error.WriteLine($"ZLib decompression error for object type {type} at offset {actualObjectOffset}: {zlibEx.Message}");
+             // Optionally log more details or attempt recovery if possible
+             return null; // Indicate failure
+        }
+        catch (Exception ex) // Catch other unexpected errors during decompression
+        {
+            Console.Error.WriteLine($"Unexpected error during ZLib decompression for object type {type} at offset {actualObjectOffset}: {ex.Message}");
+            return null; // Indicate failure
         }
 
         byte[] data = decompressedStream.ToArray();
 
         // Sanity check: Decompressed size should match the size from the header for non-delta types
+        // This check is less reliable for deltas, where 'size' is the delta instruction size.
         if (typeNum >= 1 && typeNum <= 4 && data.Length != (int)size)
         {
             // This is a warning because sometimes zlib might add padding? Though usually indicates corruption.
             Console.Error.WriteLine($"Warning: Decompressed size mismatch for {type} at offset {actualObjectOffset}. Expected {size}, got {data.Length}.");
         }
-        // For deltas, 'size' is the size of the *delta instructions*, not the final object.
 
         // Return the PackObject with the correct absolute offset and relative offset/base hash
         return new PackObject(type, data, actualObjectOffset, baseRelativeOffset, baseHash);
@@ -1049,8 +1117,7 @@ public class Program
     {
         long offset = 0;
         byte currentByte;
-        int shift = 0;
-        long byteValue;
+        // int shift = 0; // Shift logic was slightly off, simpler to build up value
 
         currentByte = reader.ReadByte();
         offset = currentByte & 0x7F; // First byte uses lower 7 bits
@@ -1077,6 +1144,8 @@ public class Program
             currentByte = reader.ReadByte();
             value |= (long)(currentByte & 0x7F) << shift;
             shift += 7;
+            // Check for potential infinite loop / invalid data
+            if (shift > 63) throw new InvalidDataException("Variable length integer exceeds 64 bits.");
         } while ((currentByte & 0x80) != 0); // Continue while MSB is set
         return value;
     }
@@ -1086,6 +1155,7 @@ public class Program
     static uint ReadNetworkUInt32(BinaryReader reader)
     {
         byte[] bytes = reader.ReadBytes(4);
+        if (bytes.Length < 4) throw new EndOfStreamException("Could not read 4 bytes for UInt32.");
         if (BitConverter.IsLittleEndian)
         {
             Array.Reverse(bytes); // Convert big-endian to little-endian if necessary
@@ -1101,6 +1171,18 @@ public class Program
         byte[] finalData;
         long originalOffset = packObject.Offset; // Keep for logging
 
+        // Check if this object (by hash, if calculable) is already resolved and stored
+        // For base types, we can calculate the hash directly
+        if (packObject.Type != "ofs_delta" && packObject.Type != "ref_delta")
+        {
+            string potentialHash = CalculateObjectHash(packObject.Type, packObject.Data);
+            if (_packObjectsByHash.ContainsKey(potentialHash))
+            {
+                return potentialHash; // Already processed and stored
+            }
+        }
+        // For deltas, we can't know the final hash until resolved, so we proceed
+
         if (packObject.Type == "ofs_delta" || packObject.Type == "ref_delta")
         {
             // --- Delta Object ---
@@ -1110,27 +1192,40 @@ public class Program
             // 2. Recursively ensure the base object is stored and get its hash
             string baseHash = StorePackObject(baseObjectRecord); // Recursive call
 
-            // 3. Get the *resolved* data of the base object
-            byte[] baseData = ReadObjectDataFromAnywhere(baseHash); // Should now exist in cache or disk
+            // Check if the *resolved* delta object is already cached by its eventual hash
+            // (This requires calculating the final hash *before* potentially applying delta again)
+            // We need the base type to calculate the final hash
+            string baseType = _packObjectsByHash[baseHash].Type; // Base type must be in cache now
+            byte[] tempFinalDataForHash = ApplyDelta(ReadObjectDataFromAnywhere(baseHash), packObject.Data); // Apply delta temporarily
+            string potentialFinalHash = CalculateObjectHash(baseType, tempFinalDataForHash);
 
-            // 4. Apply the delta instructions
-            finalData = ApplyDelta(baseData, packObject.Data);
-            // The final type is the type of the base object
-            finalType = _packObjectsByHash[baseHash].Type; // Get type from resolved base in cache
-
-            // 5. Calculate hash of the resolved object
-            finalHash = CalculateObjectHash(finalType, finalData);
-
-            // 6. Store the *resolved* object if not already present
-            if (!_packObjectsByHash.ContainsKey(finalHash))
+            if (_packObjectsByHash.ContainsKey(potentialFinalHash))
             {
-                // Create a new PackObject representing the resolved state
-                var resolvedObject = new PackObject(finalType, finalData, -1); // Offset -1 = resolved
-                _packObjectsByHash[finalHash] = resolvedObject;
-                // Write the resolved object to the loose object store
-                WriteObjectToDiskInternal(finalHash, CreateObjectBytes(finalType, finalData));
-                 // Console.WriteLine($"DEBUG: Stored resolved delta {finalType} {finalHash} (from offset {originalOffset})");
+                return potentialFinalHash; // Already resolved this delta chain
             }
+
+            // --- If not cached, proceed with full resolution ---
+            // 3. Get the *resolved* data of the base object (should be fast from cache now)
+            byte[] baseData = ReadObjectDataFromAnywhere(baseHash);
+
+            // 4. Apply the delta instructions (use the data we already calculated)
+            finalData = tempFinalDataForHash; // Reuse the data calculated for hash check
+            finalType = baseType;             // Type is the base type
+
+            // 5. Final hash is the one we calculated
+            finalHash = potentialFinalHash;
+
+            // 6. Store the *resolved* object in cache and write to disk
+            var resolvedObject = new PackObject(finalType, finalData, -1); // Offset -1 = resolved
+            _packObjectsByHash[finalHash] = resolvedObject;
+            // Write the resolved object to the loose object store
+            string objectPath = Path.Combine(".git", "objects", finalHash.Substring(0, 2), finalHash.Substring(2));
+            if (!File.Exists(objectPath)) // Avoid redundant writes
+            {
+                 WriteObjectToDiskInternal(finalHash, CreateObjectBytes(finalType, finalData), objectPath);
+            }
+            // Console.WriteLine($"DEBUG: Stored resolved delta {finalType} {finalHash} (from offset {originalOffset})");
+
         }
         else
         {
@@ -1138,16 +1233,20 @@ public class Program
             finalType = packObject.Type;
             finalData = packObject.Data; // Data is already the final content
 
-            // 1. Calculate hash
+            // 1. Calculate hash (we did this already at the start of the function)
             finalHash = CalculateObjectHash(finalType, finalData);
 
-            // 2. Store if not already present
+            // 2. Store if not already present (check should be redundant due to check at start)
             if (!_packObjectsByHash.ContainsKey(finalHash))
             {
                  // Use the original packObject read from the file
                 _packObjectsByHash[finalHash] = packObject;
                 // Write object to disk
-                WriteObjectToDiskInternal(finalHash, CreateObjectBytes(finalType, finalData));
+                string objectPath = Path.Combine(".git", "objects", finalHash.Substring(0, 2), finalHash.Substring(2));
+                 if (!File.Exists(objectPath)) // Avoid redundant writes
+                 {
+                    WriteObjectToDiskInternal(finalHash, CreateObjectBytes(finalType, finalData), objectPath);
+                 }
                  // Console.WriteLine($"DEBUG: Stored base object {finalType} {finalHash} (from offset {originalOffset})");
             }
         }
@@ -1177,7 +1276,7 @@ public class Program
             long absoluteBaseOffset = deltaObject.Offset - relativeNegativeOffset;
 
             // Look up the base object info using its absolute offset in the map built from pass 1
-            if (_packObjectsByOffset.TryGetValue(absoluteBaseOffset, out PackObject baseObjRecord))
+            if (_packObjectsByOffset.TryGetValue(absoluteBaseOffset, out PackObject? baseObjRecord) && baseObjRecord != null)
             {
                 // Return the record read from the packfile; StorePackObject will handle resolving it if needed.
                 return baseObjRecord;
@@ -1187,15 +1286,15 @@ public class Program
                 // This indicates the base object wasn't found at the calculated offset in the packfile.
                 // This could be a packfile corruption or a bug in offset calculation/reading.
                 string knownOffsets = string.Join(", ", _packObjectsByOffset.Keys.OrderBy(k => k));
-                Console.Error.WriteLine($"DEBUG: Known offsets: {knownOffsets}");
+                // Console.Error.WriteLine($"DEBUG: Known offsets: {knownOffsets}"); // Optional debug info
                 throw new InvalidOperationException($"ofs_delta base object not found at calculated absolute offset {absoluteBaseOffset} (delta started at {deltaObject.Offset}, relative offset {relativeNegativeOffset})");
             }
         }
         else if (deltaObject.Type == "ref_delta")
         {
-            string baseHash = deltaObject.BaseHash!;
+            string baseHash = deltaObject.BaseHash!; // Non-null for ref_delta
             // Priority 1: Check if the *resolved* base object is already in the hash map
-            if (_packObjectsByHash.TryGetValue(baseHash, out PackObject baseObjByHash))
+            if (_packObjectsByHash.TryGetValue(baseHash, out PackObject? baseObjByHash) && baseObjByHash != null)
             {
                  // Ensure it's not an unresolved delta itself (shouldn't happen if StorePackObject works)
                  if (baseObjByHash.Type == "ofs_delta" || baseObjByHash.Type == "ref_delta") {
@@ -1213,8 +1312,9 @@ public class Program
                  if (nullByteIndex == -1) throw new InvalidDataException($"Invalid object format on disk for {baseHash}");
                 string header = Encoding.UTF8.GetString(rawData, 0, nullByteIndex);
                 string[] headerParts = header.Split(' ');
+                if (headerParts.Length < 2) throw new InvalidDataException($"Invalid object header on disk for {baseHash}");
                 string baseType = headerParts[0];
-                byte[] baseContent = rawData.Skip(nullByteIndex + 1).ToArray();
+                byte[] baseContent = rawData[(nullByteIndex + 1)..]; // Use slicing
 
                 // Create a PackObject representing this disk object. Offset -2 indicates 'from disk'.
                 var diskBase = new PackObject(baseType, baseContent, -2, -1, baseHash);
@@ -1223,10 +1323,7 @@ public class Program
             }
 
             // Priority 3: Check if the base object exists in the packfile objects we read but haven't resolved/hashed yet.
-            // We need to find the PackObject record corresponding to this hash.
-            // This requires iterating through _packObjectsByOffset and calculating potential hashes,
-            // OR relying on the StorePackObject recursion to eventually process it.
-            // Let's search the _packObjectsByOffset values.
+            // Search the _packObjectsByOffset values.
             foreach(var kvp in _packObjectsByOffset)
             {
                 PackObject potentialBaseRecord = kvp.Value;
@@ -1271,7 +1368,8 @@ public class Program
         long targetSize = ReadVariableLengthInt(reader);
 
         // Use a MemoryStream to build the result
-        using var targetStream = new MemoryStream((int)targetSize); // Pre-allocate capacity
+        // Avoid pre-allocating if targetSize could be huge? For typical Git objects, it's fine.
+        using var targetStream = new MemoryStream((int)targetSize);
 
         while (deltaStream.Position < deltaStream.Length)
         {
@@ -1281,25 +1379,25 @@ public class Program
             {
                 long copyOffset = 0;
                 long copySize = 0;
+                int currentShift = 0; // Use local variable for shift
 
                 // Read offset bytes based on flags
-                int shift = 0;
-                if ((instruction & 0x01) != 0) { copyOffset |= (long)reader.ReadByte() << shift; shift += 8; }
-                if ((instruction & 0x02) != 0) { copyOffset |= (long)reader.ReadByte() << shift; shift += 8; }
-                if ((instruction & 0x04) != 0) { copyOffset |= (long)reader.ReadByte() << shift; shift += 8; }
-                if ((instruction & 0x08) != 0) { copyOffset |= (long)reader.ReadByte() << shift; shift += 8; }
+                if ((instruction & 0x01) != 0) { copyOffset |= (long)reader.ReadByte() << currentShift; currentShift += 8; }
+                if ((instruction & 0x02) != 0) { copyOffset |= (long)reader.ReadByte() << currentShift; currentShift += 8; }
+                if ((instruction & 0x04) != 0) { copyOffset |= (long)reader.ReadByte() << currentShift; currentShift += 8; }
+                if ((instruction & 0x08) != 0) { copyOffset |= (long)reader.ReadByte() << currentShift; currentShift += 8; }
 
                 // Read size bytes based on flags
-                shift = 0;
-                if ((instruction & 0x10) != 0) { copySize |= (long)reader.ReadByte() << shift; shift += 8; }
-                if ((instruction & 0x20) != 0) { copySize |= (long)reader.ReadByte() << shift; shift += 8; }
-                if ((instruction & 0x40) != 0) { copySize |= (long)reader.ReadByte() << shift; shift += 8; }
+                currentShift = 0; // Reset shift for size
+                if ((instruction & 0x10) != 0) { copySize |= (long)reader.ReadByte() << currentShift; currentShift += 8; }
+                if ((instruction & 0x20) != 0) { copySize |= (long)reader.ReadByte() << currentShift; currentShift += 8; }
+                if ((instruction & 0x40) != 0) { copySize |= (long)reader.ReadByte() << currentShift; currentShift += 8; }
 
                 // Size 0 means 0x10000 (65536) bytes
                 if (copySize == 0) copySize = 0x10000;
 
                 // Validate copy operation boundaries
-                if (copyOffset < 0 || copySize < 0 || copyOffset + copySize > baseData.Length)
+                if (copyOffset < 0 || copySize <= 0 || copyOffset + copySize > baseData.Length) // Size must be > 0
                     throw new InvalidDataException(
                         $"Delta copy instruction exceeds base data boundaries (offset={copyOffset}, size={copySize}, baseSize={baseData.Length}). Delta stream pos: {deltaStream.Position}");
 
@@ -1314,9 +1412,10 @@ public class Program
                     throw new InvalidDataException("Delta add instruction has zero size."); // Size 0 is invalid
 
                 // Read the data to add
+                if (deltaStream.Position + addSize > deltaStream.Length)
+                     throw new EndOfStreamException("Unexpected end of stream reading data for delta add instruction.");
                 byte[] dataToAdd = reader.ReadBytes(addSize);
-                if(dataToAdd.Length != addSize)
-                    throw new EndOfStreamException("Unexpected end of stream reading data for delta add instruction.");
+                // if(dataToAdd.Length != addSize) // ReadBytes throws if not enough bytes
 
                 // Write the added data to targetStream
                 targetStream.Write(dataToAdd, 0, dataToAdd.Length);
@@ -1328,6 +1427,8 @@ public class Program
         {
             // This usually indicates corrupted delta instructions or incorrect application
             Console.Error.WriteLine($"Warning: Delta application result size mismatch: expected {targetSize}, got {targetStream.Length}");
+            // Consider throwing an exception here if strict adherence is required
+            // throw new InvalidDataException($"Delta application result size mismatch: expected {targetSize}, got {targetStream.Length}");
         }
 
         return targetStream.ToArray();
@@ -1382,7 +1483,7 @@ public class Program
                          Console.Error.WriteLine($"Warning: Could not update ref file {refPath}: {ex.Message}");
                      }
                  }
-                 else // Detached HEAD state (points directly to commit)
+                 else // Detached HEAD state (points directly to commit) - Update HEAD file itself
                  {
                      try
                      {
@@ -1395,6 +1496,8 @@ public class Program
                  }
             } else {
                  Console.Error.WriteLine($"Warning: .git/HEAD file not found.");
+                 // Attempt to create it pointing to the commit? Or fail?
+                 // Let's assume InitRepository created it.
             }
 
 
@@ -1409,10 +1512,12 @@ public class Program
         {
             // Make error more specific
             Console.Error.WriteLine($"Error: Required object not found during checkout: {ex.Message}");
+            throw; // Re-throw to indicate checkout failure
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"Error during checkout: {ex.Message}\n{ex.StackTrace}");
+            throw; // Re-throw to indicate checkout failure
         }
     }
 
@@ -1423,7 +1528,7 @@ public class Program
         string gitDirName = ".git";
 
         // Delete files
-        foreach (string file in Directory.GetFiles(currentDir))
+        foreach (string file in Directory.EnumerateFiles(currentDir)) // Use Enumerate for potentially better perf
         {
             // Important: Use OrdinalIgnoreCase for cross-platform compatibility with ".git"
             if (Path.GetFileName(file).Equals(gitDirName, StringComparison.OrdinalIgnoreCase)) continue;
@@ -1438,7 +1543,7 @@ public class Program
         }
 
         // Delete directories
-        foreach (string dir in Directory.GetDirectories(currentDir))
+        foreach (string dir in Directory.EnumerateDirectories(currentDir)) // Use Enumerate
         {
             if (Path.GetFileName(dir).Equals(gitDirName, StringComparison.OrdinalIgnoreCase)) continue;
             try
@@ -1464,12 +1569,12 @@ public class Program
         catch (FileNotFoundException)
         {
              Console.Error.WriteLine($"Error: Tree object {treeHash} not found during checkout.");
-             return;
+             return; // Stop checkout for this subtree
         }
         catch (Exception ex)
         {
              Console.Error.WriteLine($"Error reading tree object {treeHash}: {ex.Message}");
-             return;
+             return; // Stop checkout for this subtree
         }
 
 
@@ -1490,12 +1595,23 @@ public class Program
 
             // Extract the 20-byte hash
             if (nullIndex + 1 + 20 > treeRawData.Length) break; // Not enough bytes left for hash
-            byte[] hashBytes = new byte[20];
-            Buffer.BlockCopy(treeRawData, nullIndex + 1, hashBytes, 0, 20);
+            byte[] hashBytes = treeRawData[(nullIndex + 1)..(nullIndex + 1 + 20)]; // Use range operator
             string entryHash = Convert.ToHexString(hashBytes).ToLower();
 
             // Calculate the full path for the entry
-            string fullPath = Path.Combine(basePath, name);
+            // Security: Prevent path traversal attacks (e.g., names like "../outside")
+            // Path.Combine might handle some cases, but GetFullPath normalizes and allows checks.
+            string fullPathUnchecked = Path.Combine(basePath, name);
+            string fullPath = Path.GetFullPath(fullPathUnchecked);
+            string baseFullPath = Path.GetFullPath(basePath);
+
+            if (!fullPath.StartsWith(baseFullPath))
+            {
+                 Console.Error.WriteLine($"Error: Invalid path '{name}' attempts to escape base directory during checkout. Skipping.");
+                 currentPos = nullIndex + 1 + 20; // Move to next entry
+                 continue;
+            }
+
 
             try
             {
@@ -1513,16 +1629,20 @@ public class Program
                     // Note: Requires appropriate permissions, especially on Windows.
                     try {
                          File.CreateSymbolicLink(fullPath, targetPath);
+                         Console.WriteLine($"Created symlink: {name} -> {targetPath}");
                     } catch (UnauthorizedAccessException) {
                          Console.Error.WriteLine($"Error: Insufficient permissions to create symbolic link '{fullPath}'. Try running as administrator or enabling developer mode (Windows).");
-                    } catch (IOException ioEx) when (ioEx.Message.Contains("symbolic link")) {
+                    } catch (IOException ioEx) when (ioEx.Message.Contains("symbolic link", StringComparison.OrdinalIgnoreCase)) {
                          Console.Error.WriteLine($"Error: Could not create symbolic link '{fullPath}'. OS support/privileges? {ioEx.Message}");
+                    } catch (PlatformNotSupportedException) {
+                         Console.Error.WriteLine($"Warning: Symbolic links not supported on this platform. Skipping '{name}'.");
                     }
                 }
                 else if (mode == "100644" || mode == "100755") // Regular file (executable or not)
                 {
                     byte[] blobContent = ReadObjectDataFromAnywhere(entryHash);
                     File.WriteAllBytes(fullPath, blobContent);
+                    // Console.WriteLine($"Created file: {name}"); // Optional verbose output
 
                     // Set executable permission if needed (non-Windows)
                     if (mode == "100755" && !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -1542,7 +1662,9 @@ public class Program
                 }
                  else if (mode == "160000") // Gitlink (submodule commit hash) - Ignored for now
                  {
-                     Console.WriteLine($"Ignoring submodule (gitlink) at {name}");
+                     Console.WriteLine($"Ignoring submodule (gitlink) at '{name}'");
+                     // To implement: Store the hash `entryHash` somehow, maybe create an empty directory
+                     // or a file containing the commit hash, but don't recurse into it here.
                  }
                 else
                 {
@@ -1557,10 +1679,12 @@ public class Program
              catch (IOException ioEx)
              {
                  Console.Error.WriteLine($"Error writing file/directory {fullPath}: {ioEx.Message}");
+                 // Consider if this should halt the checkout
              }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"Error processing tree entry {name} (mode {mode}, hash {entryHash}): {ex.Message}");
+                // Consider if this should halt the checkout
             }
 
 
